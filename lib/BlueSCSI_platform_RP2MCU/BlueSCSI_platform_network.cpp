@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2023 joshua stein <jcs@jcs.org>
+ * Copyright (c) 2026 Eric Helgeson <eric@bluescsi.com>
  *
  * Permission to use, copy, modify, and distribute this software for any
  * purpose with or without fee is hereby granted, provided that the above
@@ -51,6 +52,11 @@ static bool network_iface_present = false;
 static uint32_t wifi_reconnect_time = 0;
 static uint32_t wifi_reconnect_interval = WIFI_RECONNECT_INTERVAL;
 static int wifi_reconnect_attempts = 0;
+
+// Whether the current association was made with a passphrase. The CYW43 driver
+// has no getter for the auth mode of a live association, so remember what was
+// asked for at join time.
+static bool wifi_join_secured = false;
 
 bool platform_network_supported()
 {
@@ -148,6 +154,8 @@ bool platform_network_wifi_join(char *ssid, char *password, bool reconnect)
 		wifi_reconnect_interval = WIFI_RECONNECT_INTERVAL;
 		wifi_reconnect_time = platform_millis();
 	}
+
+	wifi_join_secured = (password != NULL && password[0] != 0);
 
 	if (password == NULL || password[0] == 0)
 	{
@@ -392,6 +400,18 @@ char * platform_network_wifi_bssid()
 	/* TODO */
 
 	return bssid;
+}
+
+uint8_t platform_network_wifi_flags()
+{
+	if (!wifi_join_secured)
+		return 0;
+
+	// Only claim authentication for an association that actually happened
+	if (cyw43_wifi_link_status(&cyw43_state, CYW43_ITF_STA) < CYW43_LINK_JOIN)
+		return 0;
+
+	return WIFI_NETWORK_FLAG_AUTH;
 }
 
 int platform_network_wifi_channel()
