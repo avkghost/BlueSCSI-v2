@@ -147,3 +147,5 @@ utils/analyze_crashlog.sh log.txt
 ```
 
 Use `hbreak` in GDB for hardware breakpoints — RAM breakpoints can be unreliable on RP2040 since the boot routine overwrites them.
+
+On DaynaPORT builds, enabling the normal global `SCSI.Debug` setting or the hardware debug switch also enables a compact bridge trace. This applies to both DaynaPORT in raw bridge mode and the DaynaPORT-on-bridge target, and the trace stays close to the standard SCSI device logs instead of dumping every frame.

@@ -24,6 +24,13 @@ You can find an errta of all the current and former versions in the wiki https:/
 
 https://support.jlcpcb.com/article/44-how-to-export-kicad-pcb-to-gerber-files
 
+### Network Bridge Terms
+
+1. `DaynaPORT in raw bridge mode` - the USB initiator path that forwards SCSI traffic without interpreting DaynaPORT commands.
+2. `DaynaPORT-on-bridge target` - the synthetic network target that runs DaynaPORT commands over the raw bridge.
+
+DaynaPORT targets use the normal global debug setting for bridge tracing, and the logs stay compact so they read like the other SCSI device traces instead of dumping every frame.
+
 ## Licenses
 
 ### Firmware
