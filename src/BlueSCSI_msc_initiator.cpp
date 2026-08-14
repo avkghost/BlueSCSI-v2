@@ -114,6 +114,7 @@ static struct {
 static int get_target(uint8_t lun);
 static int do_read6_or_10(int target_id, uint32_t start_sector, uint32_t sectorcount, uint32_t sectorsize, void *buffer, bool use_read10);
 static int do_write6_or_10(int target_id, uint32_t start_sector, uint32_t sectorcount, uint32_t sectorsize, const uint8_t *buffer, bool use_write10);
+static void scan_targets();
 
 static const char *msc_device_type_name(uint8_t device_type)
 {
@@ -180,7 +181,38 @@ static void refresh_target_writable_cache(uint8_t lun)
     }
 }
 
-static void publish_last_sense_to_host(uint8_t lun, int target_id)
+static bool ensure_targets_scanned()
+{
+    static bool logged_scan_delay = false;
+
+    if (g_msc_initiator_target_count > 0)
+    {
+        return true;
+    }
+
+    // The first host query can arrive before the attached target has settled,
+    // especially on slower bridges. Retry a few times before giving up so the
+    // bridge does not advertise an empty model string.
+    for (int attempt = 0; attempt < 3 && g_msc_initiator_target_count == 0; attempt++)
+    {
+        if (!logged_scan_delay)
+        {
+            logmsg("USB MSC target scan delayed, rescanning for SCSI devices");
+            logged_scan_delay = true;
+        }
+        platform_reset_watchdog();
+        scan_targets();
+        if (g_msc_initiator_target_count > 0)
+        {
+            break;
+        }
+        platform_delay_ms(250);
+    }
+
+    return g_msc_initiator_target_count > 0;
+}
+
+static void publish_last_sense_to_host(uint8_t lun, int target_id, const char *command_text)
 {
     uint8_t sense_key;
     uint8_t sense_asc;
@@ -189,6 +221,7 @@ static void publish_last_sense_to_host(uint8_t lun, int target_id)
     {
         logmsg("USB MSC sense publish: LUN ", (int)lun,
                " target ", target_id,
+               " command ", command_text,
                " sense ", (int)sense_key, "/", (int)sense_asc, "/", (int)sense_ascq);
         platform_msc_set_sense(lun, sense_key, sense_asc, sense_ascq);
     }
@@ -196,6 +229,7 @@ static void publish_last_sense_to_host(uint8_t lun, int target_id)
     {
         logmsg("USB MSC sense publish: LUN ", (int)lun,
                " target ", target_id,
+               " command ", command_text,
                " no cached sense");
     }
 }
@@ -440,7 +474,7 @@ void init_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[1
 {
     dbgmsg("-- MSC Inquiry");
 
-    if (g_msc_initiator_target_count == 0)
+    if (!ensure_targets_scanned())
     {
         memset(vendor_id, 0, 8);
         memset(product_id, 0, 8);
@@ -468,11 +502,17 @@ void init_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[1
 
 uint8_t init_msc_get_maxlun_cb(void)
 {
+    ensure_targets_scanned();
     return g_msc_initiator_target_count;
 }
 
 bool init_msc_is_writable_cb (uint8_t lun)
 {
+    if (!ensure_targets_scanned())
+    {
+        return false;
+    }
+
     if (g_msc_initiator_target_count == 0)
     {
         return false;
@@ -494,6 +534,11 @@ bool init_msc_is_writable_cb (uint8_t lun)
 bool init_msc_start_stop_cb(uint8_t lun, uint8_t power_condition, bool start, bool load_eject)
 {
     dbgmsg("-- MSC Start Stop, start: ", (int)start, ", load_eject: ", (int)load_eject);
+
+    if (!ensure_targets_scanned())
+    {
+        return false;
+    }
 
     if (g_msc_initiator_target_count == 0)
     {
@@ -531,7 +576,7 @@ bool init_msc_start_stop_cb(uint8_t lun, uint8_t power_condition, bool start, bo
         scsiClearLastRequestSense();
         uint8_t sense_key;
         scsiRequestSense(target, &sense_key);
-        publish_last_sense_to_host(lun, target);
+        publish_last_sense_to_host(lun, target, "START STOP UNIT");
         scsiLogInitiatorCommandFailure("START STOP UNIT", target, status, sense_key);
     }
 
@@ -543,6 +588,11 @@ bool init_msc_start_stop_cb(uint8_t lun, uint8_t power_condition, bool start, bo
 bool init_msc_test_unit_ready_cb(uint8_t lun)
 {
     dbgmsg("-- MSC Test Unit Ready");
+
+    if (!ensure_targets_scanned())
+    {
+        return false;
+    }
 
     if (g_msc_initiator_target_count == 0)
     {
@@ -567,7 +617,7 @@ bool init_msc_test_unit_ready_cb(uint8_t lun)
     }
     if (!ready)
     {
-        publish_last_sense_to_host(lun, get_target(lun));
+        publish_last_sense_to_host(lun, get_target(lun), "TEST UNIT READY");
     }
     return ready;
 }
@@ -576,6 +626,13 @@ void init_msc_capacity_cb(uint8_t lun, uint32_t *block_count, uint16_t *block_si
 {
     dbgmsg("-- MSC Get Capacity");
     g_msc_initiator_state.status_reqcount++;
+
+    if (!ensure_targets_scanned())
+    {
+        *block_count = 0;
+        *block_size = 0;
+        return;
+    }
 
     if (g_msc_initiator_target_count == 0 || lun >= g_msc_initiator_target_count)
     {
@@ -608,6 +665,11 @@ void init_msc_capacity_cb(uint8_t lun, uint32_t *block_count, uint16_t *block_si
 
 int32_t init_msc_scsi_cb(uint8_t lun, const uint8_t scsi_cmd[16], void *buffer, uint16_t bufsize)
 {
+    if (!ensure_targets_scanned())
+    {
+        return -1;
+    }
+
     if (g_msc_initiator_target_count == 0)
     {
         return -1;
@@ -635,7 +697,7 @@ int32_t init_msc_scsi_cb(uint8_t lun, const uint8_t scsi_cmd[16], void *buffer, 
         scsiClearLastRequestSense();
         uint8_t sense_key;
         scsiRequestSense(target, &sense_key);
-        publish_last_sense_to_host(lun, target);
+                publish_last_sense_to_host(lun, target, "READ CAPACITY");
     }
 
     LED_OFF();
@@ -746,7 +808,7 @@ static int32_t init_msc_read_partial(uint8_t lun, uint32_t lba, uint32_t offset,
             }
             else
             {
-                publish_last_sense_to_host(lun, target_id);
+                publish_last_sense_to_host(lun, target_id, "READ");
                 scsiLogInitiatorCommandFailure("SCSI Initiator read", target_id, status, sense_key);
                 g_msc_initiator_state.prefetch_sectorcount = 0;
                 g_msc_initiator_state.prefetch_done = false;
@@ -854,7 +916,7 @@ int32_t init_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void* buf
         }
         else
         {
-            publish_last_sense_to_host(lun, target_id);
+            publish_last_sense_to_host(lun, target_id, "READ");
             scsiLogInitiatorCommandFailure("SCSI Initiator read", target_id, status, sense_key);
             return -1;
         }
@@ -1007,7 +1069,7 @@ static int32_t check_write_status(uint8_t lun, int target_id, int status, uint32
         }
         else
         {
-            publish_last_sense_to_host(lun, target_id);
+            publish_last_sense_to_host(lun, target_id, "WRITE");
             scsiLogInitiatorCommandFailure("SCSI Initiator write", target_id, status, sense_key);
             return -1;
         }

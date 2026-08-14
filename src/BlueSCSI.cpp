@@ -1029,30 +1029,42 @@ STATIC_TESTABLE void reinitSCSI()
   scsiPhyReset();
   scsiDiskInit();
   scsiInit();
+  logmsg("");
+}
 
 #ifdef BLUESCSI_NETWORK
-  if (platform_network_supported()) {
-    if (scsiDiskCheckAnyNetworkDevicesConfigured())
+static void bluescsi_setup_network()
+{
+  if (!platform_network_supported())
+  {
+    return;
+  }
+
+  // Run the expansion-board WiFi path for both target and initiator/raw-bridge
+  // startup paths so the board is initialized regardless of SCSI role.
+  if (scsiDiskCheckAnyNetworkDevicesConfigured())
+  {
+    platform_network_init(scsiDev.boardCfg.wifiMACAddress);
+    if (scsiDev.boardCfg.wifiSSID[0] != '\0')
     {
-      platform_network_init(scsiDev.boardCfg.wifiMACAddress);
-      if (scsiDev.boardCfg.wifiSSID[0] != '\0')
-        platform_network_wifi_join(scsiDev.boardCfg.wifiSSID, scsiDev.boardCfg.wifiPassword, false);
-      else
-        logmsg("No Wi-Fi SSID or Password found. Use the BlueSCSI Wi-Fi DA to configure the network.");
+      platform_network_wifi_join(scsiDev.boardCfg.wifiSSID, scsiDev.boardCfg.wifiPassword, false);
     }
     else
     {
-      if (scsiDev.boardCfg.wifiSSID[0] != '\0')
-      {
-        logmsg("Wi-Fi SSID specified as \"", scsiDev.boardCfg.wifiSSID, "\", but no SCSI ID assigned to a network device");
-        logmsg("Please create an empty file \"NEx.hda\", where x is the SCSI ID of the network device, on the SD card");
-      }
-      platform_network_deinit();
+      logmsg("No Wi-Fi SSID or Password found. Use the BlueSCSI Wi-Fi DA to configure the network.");
     }
   }
-#endif // BLUESCSI_NETWORK
-  logmsg("");
+  else
+  {
+    if (scsiDev.boardCfg.wifiSSID[0] != '\0')
+    {
+      logmsg("Wi-Fi SSID specified as \"", scsiDev.boardCfg.wifiSSID, "\", but no SCSI ID assigned to a network device");
+      logmsg("Please create an empty file \"NEx.hda\", where x is the SCSI ID of the network device, on the SD card");
+    }
+    platform_network_deinit();
+  }
 }
+#endif
 
 // Alert user that update bin file not used
 static void check_for_unused_update_files()
@@ -1437,6 +1449,9 @@ extern "C" void bluescsi_setup(void)
 #endif
 
   bluescsi_setup_sd_card(!is_initiator);
+#ifdef BLUESCSI_NETWORK
+  bluescsi_setup_network();
+#endif
 #ifdef PLATFORM_MASS_STORAGE
   static bool check_mass_storage = true;
   if (check_mass_storage && !is_initiator)
