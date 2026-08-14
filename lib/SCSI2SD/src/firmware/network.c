@@ -25,7 +25,62 @@
 extern int platform_network_send(uint8_t *buf, size_t len);
 
 bool scsiNetworkEnabled = false;
+bool scsiNetworkBroadcastEnabled = false;
 struct scsiNetworkPacketQueue scsiNetworkInboundQueue;
+
+static const char *daynaportCommandName(uint8_t command)
+{
+	switch (command) {
+	case 0x08: return "Read6";
+	case 0x09: return "ReadMACAndStats";
+	case 0x0a: return "Write6";
+	case 0x0c: return "SetInterfaceMode";
+	case 0x0d: return "AddMulticastAddress";
+	case 0x0e: return "ToggleInterface";
+	case 0x1a: return "ModeSense";
+	case 0x40: return "SetMAC";
+	case 0x80: return "SetMode";
+	case SCSI_NETWORK_WIFI_CMD: return "WiFiCommand";
+	default:   return "Unknown";
+	}
+}
+
+static void daynaportTraceBegin(uint8_t command)
+{
+	int target_id = scsiDev.target ? scsiDev.target->targetId : -1;
+	(void)target_id;
+
+	DBGMSG_F("-- BUS_BUSY");
+	DBGMSG_F("---- SELECTION");
+	DBGMSG_F("------ SELECTING %d with initiator ID %d", target_id, scsiDev.initiatorId);
+	DBGMSG_F("---- COMMAND: 0x%02x (%s)", command, daynaportCommandName(command));
+	DBGMSG_F("------ OUT: 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x",
+		 scsiDev.cdb[0], scsiDev.cdb[1], scsiDev.cdb[2],
+		 scsiDev.cdb[3], scsiDev.cdb[4], scsiDev.cdb[5]);
+}
+
+static void daynaportTraceEnd(void)
+{
+	DBGMSG_F("---- STATUS");
+	DBGMSG_F("------ IN: 0x%02x", scsiDev.status);
+	DBGMSG_F("---- MESSAGE_IN");
+	DBGMSG_F("------ IN: 0x00");
+	DBGMSG_F("-- BUS_FREE");
+}
+
+static const char *daynaportFrameTypeName(const uint8_t *buf, size_t len)
+{
+	if (len < 14)
+		return "short";
+
+	switch (((uint16_t)buf[12] << 8) | buf[13])
+	{
+		case 0x0806: return "ARP";
+		case 0x0800: return "IPv4";
+		case 0x86DD: return "IPv6";
+		default: return "other";
+	}
+}
 
 struct __attribute__((packed)) wifi_network_entry wifi_network_list[WIFI_NETWORK_LIST_ENTRY_COUNT] = { 0 };
 
@@ -138,13 +193,13 @@ void scsiNetworkWifiScanResults(uint32_t size)
 		unsigned int netsize = sizeof(struct wifi_network_entry) * nets;
 		if (netsize + 2 > sizeof(scsiDev.data))
 		{
-			LOGMSG_F("WARNING: wifi_network_list is bigger than scsiDev.data, truncating", 0);
+			DBGMSG_F("%s", "WARNING: wifi_network_list is bigger than scsiDev.data, truncating");
 			netsize = sizeof(scsiDev.data) - 2;
 			netsize -= (netsize % (sizeof(struct wifi_network_entry)));
 		}
 		if (netsize + 2 > size)
 		{
-			LOGMSG_F("WARNING: wifi_network_list is bigger than requested dataLen, truncating", 0);
+			DBGMSG_F("%s", "WARNING: wifi_network_list is bigger than requested dataLen, truncating");
 			netsize = size - 2;
 			netsize -= (netsize % (sizeof(struct wifi_network_entry)));
 		}
@@ -194,7 +249,7 @@ void scsiNetworkWifiJoin(uint32_t size)
 	struct wifi_join_request req = { 0 };
 
 	if (size != sizeof(req)) {
-		LOGMSG_F("wifi_join_request bad size (%zu != %zu), ignoring", size, sizeof(req));
+		DBGMSG_F("wifi_join_request bad size (%zu != %zu), ignoring", size, sizeof(req));
 		scsiDev.status = CHECK_CONDITION;
 		scsiDev.phase = STATUS;
 		return;
@@ -217,8 +272,10 @@ int scsiNetworkCommand()
 	long len;
 	uint32_t size = (scsiDev.cdb[3] << 8) + scsiDev.cdb[4];
 	uint8_t command = scsiDev.cdb[0];
+	bool traced = !(command == 0x08 && scsiNetworkInboundQueue.readIndex == scsiNetworkInboundQueue.writeIndex);
 
-	DBGMSG_F("------ in scsiNetworkCommand with command 0x%02x (size %d)", command, size);
+	if (traced)
+		daynaportTraceBegin(command);
 
 	switch (command) {
 	case 0x08:
@@ -402,8 +459,21 @@ int scsiNetworkCommand()
 		break;
 
 	case 0x0c:
-		// set interface mode (ignored)
-		//broadcasts = (scsiDev.cdb[4] == 0x04);
+		// set interface mode
+		scsiNetworkBroadcastEnabled = (scsiDev.cdb[4] == 0x04);
+		DBGMSG_F("%s: set interface mode, broadcast %s (cdb[4]=0x%02x)",
+				__func__,
+				scsiNetworkBroadcastEnabled ? "enabled" : "disabled",
+				scsiDev.cdb[4]);
+		// Keep the interface available when the client explicitly enables broadcast mode.
+		if (scsiNetworkBroadcastEnabled)
+		{
+			scsiNetworkEnabled = true;
+		}
+		else
+		{
+			scsiNetworkEnabled = false;
+		}
 		break;
 
 	case 0x0d:
@@ -454,7 +524,7 @@ int scsiNetworkCommand()
 
 	// custom wifi commands all using the same opcode, with a sub-command in cdb[2]
 	case SCSI_NETWORK_WIFI_CMD:
-		DBGMSG_F("------ in scsiNetworkCommand with wi-fi command 0x%02x (size %d)", scsiDev.cdb[2], size);
+		DBGMSG_F("DaynaPORT wifi cmd=0x%02x size=%u", scsiDev.cdb[2], (unsigned)size);
 
 		switch (scsiDev.cdb[1]) {
 		case SCSI_NETWORK_WIFI_CMD_SCAN:
@@ -476,17 +546,24 @@ int scsiNetworkCommand()
 		break;
 	}
 
+	if (traced)
+		daynaportTraceEnd();
+
 	return 1;
 }
 
 int scsiNetworkEnqueue(const uint8_t *buf, size_t len)
 {
 	if (!scsiNetworkEnabled)
+	{
+		DBGMSG_F("DaynaPORT drop len=%u type=%s reason=disabled",
+		         (unsigned)len, daynaportFrameTypeName(buf, len));
 		return 0;
+	}
 
 	if (len + 4 > sizeof(scsiNetworkInboundQueue.packets[0]))
 	{
-		DBGMSG_F("%s: dropping incoming network packet, too large (%zu > %zu)", __func__, len, sizeof(scsiNetworkInboundQueue.packets[0]));
+		DBGMSG_F("DaynaPORT drop len=%u reason=too_large", (unsigned)len);
 		return 0;
 	}
 
@@ -513,7 +590,8 @@ int scsiNetworkEnqueue(const uint8_t *buf, size_t len)
 
 	if (scsiNetworkInboundQueue.writeIndex == scsiNetworkInboundQueue.readIndex)
 	{
-		DBGMSG_F("%s: dropping packets in ring, write index caught up to read index", __func__);
+		DBGMSG_F("DaynaPORT queue full read=%u write=%u",
+		         scsiNetworkInboundQueue.readIndex, scsiNetworkInboundQueue.writeIndex);
 	}
 
 	return 1;

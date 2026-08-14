@@ -52,6 +52,41 @@ static uint32_t wifi_reconnect_time = 0;
 static uint32_t wifi_reconnect_interval = WIFI_RECONNECT_INTERVAL;
 static int wifi_reconnect_attempts = 0;
 
+static const char *daynaport_ethertype_name(const uint8_t *buf, size_t len)
+{
+	if (len < 14)
+		return "short";
+
+	switch (((uint16_t)buf[12] << 8) | buf[13])
+	{
+		case 0x0806: return "ARP";
+		case 0x0800: return "IPv4";
+		case 0x86DD: return "IPv6";
+		default: return "other";
+	}
+}
+
+static void daynaport_log_frame(const char *prefix, const uint8_t *buf, size_t len)
+{
+	if (len >= 14) {
+		DBGMSG_F("%s: len=%d type=%s", prefix, (int)len, daynaport_ethertype_name(buf, len));
+	} else {
+		DBGMSG_F("%s: len=%d type=%s", prefix, (int)len, daynaport_ethertype_name(buf, len));
+	}
+}
+
+#if CYW43_LWIP
+static void log_wifi_station_ip()
+{
+	char ipbuf[16] = { 0 };
+	const uint8_t *ip = (const uint8_t *)&cyw43_state.netif[CYW43_ITF_STA].ip_addr.addr;
+	if (ip[0] != 0 || ip[1] != 0 || ip[2] != 0 || ip[3] != 0) {
+		snprintf(ipbuf, sizeof(ipbuf), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+		logmsg("Wi-Fi STA IP: ", ipbuf);
+	}
+}
+#endif
+
 bool platform_network_supported()
 {
 	/* from cores/rp2040/RP2040Support.h */
@@ -238,9 +273,12 @@ void platform_network_poll()
 
 int platform_network_send(uint8_t *buf, size_t len)
 {
+	daynaport_log_frame("DaynaPORT bridge TX frame", buf, len);
 	int ret = cyw43_send_ethernet(&cyw43_state, 0, len, buf, 0);
 	if (ret != 0)
-		logmsg("cyw43_send_ethernet failed: ", ret);
+		DBGMSG_F("DaynaPORT bridge TX failed: %d", ret);
+	else
+		DBGMSG_F("%s", "DaynaPORT bridge TX complete");
 
 	return ret;
 }
@@ -413,7 +451,16 @@ int cyw43_tcpip_link_status(cyw43_t *self, int itf)
 
 void cyw43_cb_process_ethernet(void *cb_data, int itf, size_t len, const uint8_t *buf)
 {
-	scsiNetworkEnqueue(buf, len);
+	daynaport_log_frame("DaynaPORT bridge RX frame", buf, len);
+	int accepted = scsiNetworkEnqueue(buf, len);
+	if (accepted)
+	{
+		DBGMSG_F("%s", "DaynaPORT bridge RX enqueued");
+	}
+	else
+	{
+		DBGMSG_F("%s", "DaynaPORT bridge RX dropped");
+	}
 }
 
 void cyw43_cb_tcpip_set_link_down(cyw43_t *self, int itf)
@@ -428,6 +475,9 @@ void cyw43_cb_tcpip_set_link_up(cyw43_t *self, int itf)
 	if (ssid)
 	{
 		logmsg("Successfully connected to Wi-Fi SSID \"",ssid,"\"");
+#if CYW43_LWIP
+		log_wifi_station_ip();
+#endif
 		// blink LED 3 times when connected
 		PICO_W_LED_OFF();
 		for (uint8_t i = 0; i < 3; i++)
