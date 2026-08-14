@@ -40,6 +40,9 @@ bool platform_run_msc();
 /* perform any cleanup tasks for the MSC-specific functionality */
 void platform_exit_msc();
 
+/* publish sense data to the USB host in initiator mode */
+void platform_msc_set_sense(uint8_t lun, uint8_t sense_key, uint8_t asc, uint8_t ascq);
+
 /* Block re-entrant msc poll calls.
    This avoids starting another command handler while first one is running.
    */

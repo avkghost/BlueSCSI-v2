@@ -62,6 +62,9 @@ static struct {
     uint32_t sectorsize;
     uint32_t sectorcount;
     bool use_read10; // Always use read10/write10 commands for this target
+    bool block_io_supported; // True when the target should behave like a block device
+    bool writable; // Cached write-protect state for the host-facing LUN
+    bool media_ready; // Cached TEST UNIT READY state for refresh gating
     uint8_t device_type; // Peripheral device type from INQUIRY byte 0
     bool is_removable;   // RMB bit from INQUIRY byte 1
 } g_msc_initiator_targets[NUM_SCSIID];
@@ -108,8 +111,94 @@ static struct {
     uint32_t last_scan_time;
 } g_msc_initiator_state;
 
+static int get_target(uint8_t lun);
 static int do_read6_or_10(int target_id, uint32_t start_sector, uint32_t sectorcount, uint32_t sectorsize, void *buffer, bool use_read10);
 static int do_write6_or_10(int target_id, uint32_t start_sector, uint32_t sectorcount, uint32_t sectorsize, const uint8_t *buffer, bool use_write10);
+
+static const char *msc_device_type_name(uint8_t device_type)
+{
+    switch (device_type)
+    {
+        case SCSI_DEVICE_TYPE_DIRECT_ACCESS:  return "DISK";
+        case SCSI_DEVICE_TYPE_SEQUENTIAL:     return "TAPE";
+        case SCSI_DEVICE_TYPE_PRINTER:        return "PRINTER";
+        case SCSI_DEVICE_TYPE_PROCESSOR:      return "PROCESSOR";
+        case SCSI_DEVICE_TYPE_WRITE_ONCE:     return "WRITE-ONCE";
+        case SCSI_DEVICE_TYPE_CD:             return "CD-ROM";
+        case SCSI_DEVICE_TYPE_SCANNER:        return "SCANNER";
+        case SCSI_DEVICE_TYPE_MO:             return "MO";
+        case SCSI_DEVICE_TYPE_MEDIA_CHANGER:  return "MEDIA-CHANGER";
+        case SCSI_DEVICE_TYPE_COMMUNICATION:  return "COMMUNICATION";
+        case SCSI_DEVICE_TYPE_ASC_IT8_A:      return "ASC-IT8-A";
+        case SCSI_DEVICE_TYPE_ASC_IT8_B:      return "ASC-IT8-B";
+        case SCSI_DEVICE_TYPE_DISK_ARRAY:     return "DISK-ARRAY";
+        default:                              return "UNKNOWN";
+    }
+}
+
+static bool msc_device_supports_block_io(uint8_t device_type)
+{
+    switch (device_type)
+    {
+        case SCSI_DEVICE_TYPE_DIRECT_ACCESS:
+        case SCSI_DEVICE_TYPE_WRITE_ONCE:
+        case SCSI_DEVICE_TYPE_CD:
+        case SCSI_DEVICE_TYPE_MO:
+        case SCSI_DEVICE_TYPE_DISK_ARRAY:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static void refresh_target_writable_cache(uint8_t lun)
+{
+    if (lun >= g_msc_initiator_target_count)
+    {
+        return;
+    }
+
+    g_msc_initiator_targets[lun].writable = false;
+
+    if (g_msc_initiator_state.readonly || !g_msc_initiator_targets[lun].block_io_supported)
+    {
+        return;
+    }
+
+    int target = get_target(lun);
+    uint8_t command[6] = {0x1A, 0x08, 0, 0, 4, 0}; // MODE SENSE(6)
+    uint8_t response[4] = {0};
+
+    LED_ON();
+    g_msc_initiator_state.status_reqcount++;
+    int status = scsiInitiatorRunCommand(target, command, 6, response, 4, NULL, 0);
+    LED_OFF();
+
+    if (status == 0)
+    {
+        g_msc_initiator_targets[lun].writable = (response[2] & 0x80) == 0;
+    }
+}
+
+static void publish_last_sense_to_host(uint8_t lun, int target_id)
+{
+    uint8_t sense_key;
+    uint8_t sense_asc;
+    uint8_t sense_ascq;
+    if (scsiGetLastRequestSense(&sense_key, &sense_asc, &sense_ascq))
+    {
+        logmsg("USB MSC sense publish: LUN ", (int)lun,
+               " target ", target_id,
+               " sense ", (int)sense_key, "/", (int)sense_asc, "/", (int)sense_ascq);
+        platform_msc_set_sense(lun, sense_key, sense_asc, sense_ascq);
+    }
+    else
+    {
+        logmsg("USB MSC sense publish: LUN ", (int)lun,
+               " target ", target_id,
+               " no cached sense");
+    }
+}
 
 static void scan_targets()
 {
@@ -121,13 +210,9 @@ static void scan_targets()
     {
         if (target_id == initiator_id) continue;
 
-        // INQUIRY answers with or without media in the drive, so it detects
-        // the device itself. An empty removable drive (MO, Zip, CD) registers
-        // here and reports "medium not present" to the USB host until a
-        // cartridge is loaded, like any USB card reader.
-        // No START STOP UNIT here: starting or stopping media is the USB
-        // host's decision (via its own callback), and sending it during a
-        // removable-media load can disturb the drive.
+        // INQUIRY answers with or without media loaded, so it detects the
+        // device itself. Empty removable media reports "medium not present"
+        // later, through the normal sense path.
         bool inquiryok = scsiInquiry(target_id, inquiry_data);
         if (!inquiryok) continue;
 
@@ -137,13 +222,13 @@ static void scan_targets()
         memcpy(product_id, &inquiry_data[16], 16);
         uint8_t device_type = inquiry_data[0] & 0x1F;
         bool is_removable = (inquiry_data[1] & 0x80) != 0;
-        const char *type_name = (device_type == SCSI_DEVICE_TYPE_CD) ? "CD-ROM" :
-                                (device_type == SCSI_DEVICE_TYPE_MO) ? "MO" :
-                                (device_type == SCSI_DEVICE_TYPE_DIRECT_ACCESS) ?
-                                (is_removable ? "REMOVABLE" : "DISK") : "OTHER";
         g_msc_initiator_targets[found_count].target_id = target_id;
         g_msc_initiator_targets[found_count].device_type = device_type;
         g_msc_initiator_targets[found_count].is_removable = is_removable;
+        g_msc_initiator_targets[found_count].block_io_supported = msc_device_supports_block_io(device_type);
+        g_msc_initiator_targets[found_count].writable = false;
+        g_msc_initiator_targets[found_count].media_ready = false;
+        const char *type_name = msc_device_type_name(device_type);
 
         bool ready = scsiTestUnitReady(target_id);
         uint32_t sectorcount = 0, sectorsize = 0;
@@ -152,30 +237,59 @@ static void scan_targets()
 
         if (readcapok)
         {
-            logmsg("Found SCSI drive with ID ", target_id, ": ", vendor_id, " ", product_id,
-                " (", type_name, ")",
-                " capacity ", (int)(((uint64_t)sectorcount * sectorsize) / 1024 / 1024), " MB");
-            g_msc_initiator_targets[found_count].sectorcount = sectorcount;
-            g_msc_initiator_targets[found_count].sectorsize = sectorsize;
-            g_msc_initiator_targets[found_count].use_read10 = scsiInitiatorTestSupportsRead10(target_id, sectorsize);
+            if (g_msc_initiator_targets[found_count].block_io_supported)
+            {
+                logmsg("Found SCSI device with ID ", target_id, ": ", vendor_id, " ", product_id,
+                    " (", type_name, ")",
+                    " capacity ", (int)(((uint64_t)sectorcount * sectorsize) / 1024 / 1024), " MB");
+                g_msc_initiator_targets[found_count].sectorcount = sectorcount;
+                g_msc_initiator_targets[found_count].sectorsize = sectorsize;
+                g_msc_initiator_targets[found_count].use_read10 = scsiInitiatorTestSupportsRead10(target_id, sectorsize);
+                g_msc_initiator_targets[found_count].media_ready = true;
+                refresh_target_writable_cache(found_count);
+            }
+            else
+            {
+                logmsg("Found SCSI device with ID ", target_id, ": ", vendor_id, " ", product_id,
+                    " (", type_name, ")",
+                    " reported capacity but is exposed as raw-only");
+                g_msc_initiator_targets[found_count].sectorcount = 0;
+                g_msc_initiator_targets[found_count].sectorsize = 0;
+                g_msc_initiator_targets[found_count].use_read10 = true;
+                g_msc_initiator_targets[found_count].writable = false;
+                g_msc_initiator_targets[found_count].media_ready = false;
+            }
         }
-        else if (ready)
+        else if (ready && g_msc_initiator_targets[found_count].block_io_supported &&
+                 device_type == SCSI_DEVICE_TYPE_DIRECT_ACCESS)
         {
-            logmsg("Found SCSI drive with ID ", target_id, ": ", vendor_id, " ", product_id,
+            logmsg("Found SCSI device with ID ", target_id, ": ", vendor_id, " ", product_id,
                    " (", type_name, ")",
                    " but failed to read capacity. Assuming SCSI-1 drive up to 1 GB.");
             g_msc_initiator_targets[found_count].sectorcount = 2097152;
             g_msc_initiator_targets[found_count].sectorsize = 512;
             g_msc_initiator_targets[found_count].use_read10 = false;
+            g_msc_initiator_targets[found_count].media_ready = true;
+            refresh_target_writable_cache(found_count);
         }
         else
         {
-            // Capacity gets probed again by the host once media is loaded
-            logmsg("Found SCSI drive with ID ", target_id, ": ", vendor_id, " ", product_id,
-                   " (", type_name, ") - no media present");
+            if (g_msc_initiator_targets[found_count].block_io_supported)
+            {
+                // Capacity gets probed again by the host once media is loaded
+                logmsg("Found SCSI device with ID ", target_id, ": ", vendor_id, " ", product_id,
+                       " (", type_name, ") - no media present");
+            }
+            else
+            {
+                logmsg("Found SCSI device with ID ", target_id, ": ", vendor_id, " ", product_id,
+                       " (", type_name, ") - raw-only bridge target");
+            }
             g_msc_initiator_targets[found_count].sectorcount = 0;
             g_msc_initiator_targets[found_count].sectorsize = 0;
             g_msc_initiator_targets[found_count].use_read10 = true;
+            g_msc_initiator_targets[found_count].writable = false;
+            g_msc_initiator_targets[found_count].media_ready = false;
         }
         found_count++;
     }
@@ -189,7 +303,7 @@ bool setup_msc_initiator()
     if (platform_is_pico_w()) {
         platform_disable_led();
     }
-    logmsg("SCSI Initiator: activating USB MSC mode");
+    logmsg("SCSI Initiator: activating USB raw bridge mode");
     g_msc_initiator = true;
 
     // We can use the device mode buffer for prefetching data in initiator mode.
@@ -222,7 +336,7 @@ bool setup_msc_initiator()
     // Scan for targets
     scan_targets();
 
-    logmsg("SCSI Initiator: found " , g_msc_initiator_target_count, " SCSI drives");
+    logmsg("SCSI Initiator: found " , g_msc_initiator_target_count, " SCSI devices");
     return g_msc_initiator_target_count > 0;
 }
 
@@ -258,7 +372,8 @@ void poll_msc_initiator()
     platform_poll();
     platform_msc_lock_set(true); // Cannot handle new MSC commands while running prefetch
     if (g_msc_initiator_state.prefetch_sectorcount > 0
-        && !g_msc_initiator_state.prefetch_done)
+        && !g_msc_initiator_state.prefetch_done
+        && !g_msc_initiator_state.stage_active)
     {
         LED_ON();
 
@@ -368,16 +483,12 @@ bool init_msc_is_writable_cb (uint8_t lun)
         return false;
     }
 
-    LED_ON();
-    g_msc_initiator_state.status_reqcount++;
+    if (!g_msc_initiator_targets[lun].block_io_supported)
+    {
+        return false;
+    }
 
-    int target = get_target(lun);
-    uint8_t command[6] = {0x1A, 0x08, 0, 0, 4, 0}; // MODE SENSE(6)
-    uint8_t response[4] = {0};
-    scsiInitiatorRunCommand(target, command, 6, response, 4, NULL, 0);
-
-    LED_OFF();
-    return (response[2] & 0x80) == 0; // Check write protected bit
+    return g_msc_initiator_targets[lun].writable;
 }
 
 bool init_msc_start_stop_cb(uint8_t lun, uint8_t power_condition, bool start, bool load_eject)
@@ -417,8 +528,10 @@ bool init_msc_start_stop_cb(uint8_t lun, uint8_t power_condition, bool start, bo
 
     if (status == 2)
     {
+        scsiClearLastRequestSense();
         uint8_t sense_key;
         scsiRequestSense(target, &sense_key);
+        publish_last_sense_to_host(lun, target);
         scsiLogInitiatorCommandFailure("START STOP UNIT", target, status, sense_key);
     }
 
@@ -437,7 +550,26 @@ bool init_msc_test_unit_ready_cb(uint8_t lun)
     }
 
     g_msc_initiator_state.status_reqcount++;
-    return scsiTestUnitReady(get_target(lun));
+    scsiClearLastRequestSense();
+    bool ready = scsiTestUnitReady(get_target(lun));
+    if (g_msc_initiator_targets[lun].block_io_supported)
+    {
+        if (!ready)
+        {
+            g_msc_initiator_targets[lun].media_ready = false;
+            g_msc_initiator_targets[lun].writable = false;
+        }
+        else
+        {
+            g_msc_initiator_targets[lun].media_ready = true;
+            g_msc_initiator_targets[lun].writable = true;
+        }
+    }
+    if (!ready)
+    {
+        publish_last_sense_to_host(lun, get_target(lun));
+    }
+    return ready;
 }
 
 void init_msc_capacity_cb(uint8_t lun, uint32_t *block_count, uint16_t *block_size)
@@ -497,6 +629,14 @@ int32_t init_msc_scsi_cb(uint8_t lun, const uint8_t scsi_cmd[16], void *buffer, 
                                          scsi_cmd, cmdlen,
                                          NULL, 0,
                                          (const uint8_t*)buffer, bufsize);
+
+    if (status != 0)
+    {
+        scsiClearLastRequestSense();
+        uint8_t sense_key;
+        scsiRequestSense(target, &sense_key);
+        publish_last_sense_to_host(lun, target);
+    }
 
     LED_OFF();
 
@@ -586,6 +726,7 @@ static int32_t init_msc_read_partial(uint8_t lun, uint32_t lba, uint32_t offset,
         if (status != 0 && depth > 1)
         {
             // A bad sector later in the window should not fail this chunk
+            scsiClearLastRequestSense();
             uint8_t sense_key;
             scsiRequestSense(target_id, &sense_key);
             depth = 1;
@@ -596,6 +737,7 @@ static int32_t init_msc_read_partial(uint8_t lun, uint32_t lba, uint32_t offset,
 
         if (status != 0)
         {
+            scsiClearLastRequestSense();
             uint8_t sense_key;
             scsiRequestSense(target_id, &sense_key);
             if (sense_key == RECOVERED_ERROR)
@@ -604,6 +746,7 @@ static int32_t init_msc_read_partial(uint8_t lun, uint32_t lba, uint32_t offset,
             }
             else
             {
+                publish_last_sense_to_host(lun, target_id);
                 scsiLogInitiatorCommandFailure("SCSI Initiator read", target_id, status, sense_key);
                 g_msc_initiator_state.prefetch_sectorcount = 0;
                 g_msc_initiator_state.prefetch_done = false;
@@ -697,6 +840,7 @@ int32_t init_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void* buf
 
     if (status != 0)
     {
+        scsiClearLastRequestSense();
         uint8_t sense_key;
         scsiRequestSense(target_id, &sense_key);
 
@@ -710,6 +854,7 @@ int32_t init_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void* buf
         }
         else
         {
+            publish_last_sense_to_host(lun, target_id);
             scsiLogInitiatorCommandFailure("SCSI Initiator read", target_id, status, sense_key);
             return -1;
         }
@@ -789,10 +934,66 @@ static int do_write6_or_10(int target_id, uint32_t start_sector, uint32_t sector
 }
 
 // Check write status and decide whether the operation counts as failed.
-static int32_t check_write_status(int target_id, int status, uint32_t start_sector)
+static int32_t check_write_status(uint8_t lun, int target_id, int status, uint32_t start_sector);
+
+static bool flush_write_cache(uint8_t lun, bool force)
+{
+    if (!g_msc_initiator_state.stage_active || g_msc_initiator_state.stage_bytes == 0)
+    {
+        return true;
+    }
+
+    int target_id = g_msc_initiator_state.stage_target_id;
+    uint32_t sectorsize = g_msc_initiator_targets[lun].sectorsize;
+    uint32_t full_bytes = g_msc_initiator_state.stage_bytes - (g_msc_initiator_state.stage_bytes % sectorsize);
+    if (full_bytes == 0)
+    {
+        return !force;
+    }
+
+    bool use_read10 = g_msc_initiator_targets[lun].use_read10;
+    uint32_t sectorcount = full_bytes / sectorsize;
+    uint32_t start_sector = g_msc_initiator_state.stage_lba;
+
+    dbgmsg("USB Write cache flush ", (int)start_sector, " + ", (int)sectorcount, "x", (int)sectorsize);
+
+    LED_ON();
+    int status = do_write6_or_10(target_id, start_sector, sectorcount, sectorsize,
+                                 g_msc_initiator_state.prefetch_buffer, use_read10);
+    LED_OFF();
+
+    if (check_write_status(lun, target_id, status, start_sector) != 0)
+    {
+        return false;
+    }
+
+    g_msc_initiator_state.status_reqcount++;
+    g_msc_initiator_state.status_bytecount += full_bytes;
+
+    uint32_t leftover = g_msc_initiator_state.stage_bytes - full_bytes;
+    g_msc_initiator_state.stage_lba += sectorcount;
+    if (leftover > 0)
+    {
+        memmove(g_msc_initiator_state.prefetch_buffer,
+                g_msc_initiator_state.prefetch_buffer + full_bytes,
+                leftover);
+        g_msc_initiator_state.stage_bytes = leftover;
+    }
+    else
+    {
+        g_msc_initiator_state.stage_active = false;
+        g_msc_initiator_state.stage_bytes = 0;
+    }
+
+    return true;
+}
+
+// Check write status and decide whether the operation counts as failed.
+static int32_t check_write_status(uint8_t lun, int target_id, int status, uint32_t start_sector)
 {
     if (status != 0)
     {
+        scsiClearLastRequestSense();
         uint8_t sense_key;
         scsiRequestSense(target_id, &sense_key);
 
@@ -806,6 +1007,7 @@ static int32_t check_write_status(int target_id, int status, uint32_t start_sect
         }
         else
         {
+            publish_last_sense_to_host(lun, target_id);
             scsiLogInitiatorCommandFailure("SCSI Initiator write", target_id, status, sense_key);
             return -1;
         }
@@ -814,16 +1016,12 @@ static int32_t check_write_status(int target_id, int status, uint32_t start_sect
     return 0;
 }
 
-// Accept a host write chunk smaller than one device sector. Chunks are
-// staged in the prefetch buffer and the sector is written out once the
-// last chunk arrives. Must not return 0 for the same reason as reads:
-// TinyUSB retries a zero return forever.
-static int32_t init_msc_write_partial(uint8_t lun, uint32_t lba, uint32_t offset, const uint8_t *buffer, uint32_t bufsize)
+// Accept a host write chunk, stage it in the bounce buffer, and flush
+// contiguous runs to the target in larger batches.
+static int32_t append_write_data(uint8_t lun, uint32_t lba, uint32_t offset, const uint8_t *buffer, uint32_t bufsize)
 {
     int target_id = get_target(lun);
     uint32_t sectorsize = g_msc_initiator_targets[lun].sectorsize;
-    bool use_read10 = g_msc_initiator_targets[lun].use_read10;
-    uint8_t *stage = g_msc_initiator_state.prefetch_buffer;
 
     if (g_msc_initiator_state.prefetch_bufsize < sectorsize)
     {
@@ -832,51 +1030,73 @@ static int32_t init_msc_write_partial(uint8_t lun, uint32_t lba, uint32_t offset
         return -1;
     }
 
-    if (offset == 0)
+    if (!g_msc_initiator_state.stage_active)
     {
-        // Staging reuses the prefetch buffer, so drop any cached read data
-        g_msc_initiator_state.prefetch_sectorcount = 0;
-        g_msc_initiator_state.prefetch_done = false;
+        if (offset != 0)
+        {
+            logmsg("USB write chunk out of sequence at LBA ", (int)lba, " offset ", (int)offset);
+            return -1;
+        }
+
         g_msc_initiator_state.stage_active = true;
         g_msc_initiator_state.stage_lba = lba;
         g_msc_initiator_state.stage_target_id = target_id;
         g_msc_initiator_state.stage_bytes = 0;
     }
-    else if (!g_msc_initiator_state.stage_active ||
-             g_msc_initiator_state.stage_lba != lba ||
-             g_msc_initiator_state.stage_target_id != target_id ||
-             g_msc_initiator_state.stage_bytes != offset)
+    else if (g_msc_initiator_state.stage_target_id != target_id ||
+             g_msc_initiator_state.stage_lba + (g_msc_initiator_state.stage_bytes / sectorsize) != lba ||
+             (g_msc_initiator_state.stage_bytes % sectorsize) != offset)
     {
         logmsg("USB write chunk out of sequence at LBA ", (int)lba, " offset ", (int)offset);
         g_msc_initiator_state.stage_active = false;
         return -1;
     }
 
-    uint32_t len = sectorsize - offset;
-    if (len > bufsize) len = bufsize;
-    memcpy(stage + offset, buffer, len);
-    g_msc_initiator_state.stage_bytes += len;
+    // Staging reuses the prefetch buffer, so drop any cached read data.
+    g_msc_initiator_state.prefetch_sectorcount = 0;
+    g_msc_initiator_state.prefetch_done = false;
 
-    if (g_msc_initiator_state.stage_bytes < sectorsize)
+    uint32_t stage_capacity = g_msc_initiator_state.prefetch_bufsize;
+    uint32_t consumed = 0;
+    while (consumed < bufsize)
     {
-        // More chunks needed before the sector can be written out
-        return len;
+        if (!g_msc_initiator_state.stage_active)
+        {
+            g_msc_initiator_state.stage_active = true;
+            g_msc_initiator_state.stage_target_id = target_id;
+            g_msc_initiator_state.stage_bytes = 0;
+        }
+
+        if (g_msc_initiator_state.stage_bytes == stage_capacity)
+        {
+            if (!flush_write_cache(lun, false))
+            {
+                return -1;
+            }
+            continue;
+        }
+
+        uint32_t room = stage_capacity - g_msc_initiator_state.stage_bytes;
+        uint32_t len = bufsize - consumed;
+        if (len > room)
+        {
+            len = room;
+        }
+
+        memcpy(g_msc_initiator_state.prefetch_buffer + g_msc_initiator_state.stage_bytes, buffer + consumed, len);
+        g_msc_initiator_state.stage_bytes += len;
+        consumed += len;
+
+        if (g_msc_initiator_state.stage_bytes == stage_capacity)
+        {
+            if (!flush_write_cache(lun, false))
+            {
+                return -1;
+            }
+        }
     }
 
-    g_msc_initiator_state.stage_active = false;
-
-    LED_ON();
-    int status = do_write6_or_10(target_id, lba, 1, sectorsize, stage, use_read10);
-    LED_OFF();
-
-    if (check_write_status(target_id, status, lba) != 0)
-    {
-        return -1;
-    }
-
-    g_msc_initiator_state.status_reqcount++;
-    g_msc_initiator_state.status_bytecount += sectorsize;
-    return len;
+    return bufsize;
 }
 
 int32_t init_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize)
@@ -897,40 +1117,26 @@ int32_t init_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t 
         return -1;
     }
 
-    if (offset != 0 || bufsize < g_msc_initiator_targets[lun].sectorsize)
+    if (!g_msc_initiator_targets[lun].block_io_supported)
     {
-        return init_msc_write_partial(lun, lba, offset, buffer, bufsize);
-    }
-
-    int target_id = get_target(lun);
-    int sectorsize = g_msc_initiator_targets[lun].sectorsize;
-    bool use_read10 = g_msc_initiator_targets[lun].use_read10;
-    uint32_t start_sector = lba;
-    uint32_t sectorcount = bufsize / sectorsize;
-
-    LED_ON();
-
-    int status = do_write6_or_10(target_id, start_sector, sectorcount, sectorsize, buffer, use_read10);
-
-    g_msc_initiator_state.prefetch_sectorcount = 0; // Invalidate prefetch cache
-    g_msc_initiator_state.prefetch_done = false;
-    g_msc_initiator_state.stage_active = false;
-
-    g_msc_initiator_state.status_reqcount++;
-    g_msc_initiator_state.status_bytecount += sectorcount * sectorsize;
-    LED_OFF();
-
-    if (check_write_status(target_id, status, start_sector) != 0)
-    {
+        logmsg("--- Refusing host write request, target is raw-only.");
         return -1;
     }
 
-    return sectorcount * sectorsize;
+    return append_write_data(lun, lba, offset, buffer, bufsize);
 }
 
 void init_msc_write10_complete_cb(uint8_t lun)
 {
-    (void)lun;
+    if (lun >= g_msc_initiator_target_count)
+    {
+        return;
+    }
+
+    if (!flush_write_cache(lun, true))
+    {
+        logmsg("USB write cache flush failed for LUN ", (int)lun);
+    }
     g_msc_initiator_state.stage_active = false;
 }
 

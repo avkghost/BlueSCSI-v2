@@ -34,6 +34,7 @@ extern "C" {
 #include "BlueSCSI_platform.h"
 #include "BlueSCSI_disk.h"
 #include "BlueSCSI_log.h"
+#include "BlueSCSI_initiator.h"
 #include "BlueSCSI_msc.h"
 #include "BlueSCSI_msc_initiator.h"
 #include "BlueSCSI_config.h"
@@ -233,6 +234,69 @@ void platform_exit_msc() {
    g_MSC.unitReady = 0;
 }
 
+void platform_msc_set_sense(uint8_t lun, uint8_t sense_key, uint8_t asc, uint8_t ascq)
+{
+  tud_msc_set_sense(lun, sense_key, asc, ascq);
+}
+
+extern "C" int32_t tud_msc_request_sense_cb(uint8_t lun, void* buffer, uint16_t bufsize)
+{
+  MSCScopedLock lock;
+  if (!g_msc_initiator)
+  {
+    return 18;
+  }
+
+  uint16_t raw_len = 0;
+  if (scsiTakeLastRequestSenseRaw((uint8_t*)buffer, bufsize, &raw_len))
+  {
+    logmsg("USB MSC request sense raw: LUN ", (int)lun,
+           " bytes ", (int)raw_len, " ", bytearray((uint8_t*)buffer, raw_len));
+    return raw_len;
+  }
+
+  return 18;
+}
+
+static uint32_t msc_lun_sector_size(uint8_t lun)
+{
+  if (g_MSC.SDMode) {
+    return SD_SECTOR_SIZE;
+  }
+
+  return g_MSC.lun_config[lun]->bytesPerSector;
+}
+
+static bool msc_read_data(uint8_t lun, uint32_t lba, void* buffer, uint32_t bufsize)
+{
+  if (g_MSC.SDMode) {
+    return SD.card()->readSectors(lba, (uint8_t*)buffer, bufsize / SD_SECTOR_SIZE);
+  }
+
+  if (!g_MSC.lun_unitReady[lun]) {
+    logmsg("Attempted read to non-ready LUN ", lun);
+    return false;
+  }
+
+  g_MSC.lun_config[lun]->file.seek(lba * g_MSC.lun_config[lun]->bytesPerSector);
+  return g_MSC.lun_config[lun]->file.read(buffer, bufsize);
+}
+
+static bool msc_write_data(uint8_t lun, uint32_t lba, uint8_t* buffer, uint32_t bufsize)
+{
+  if (g_MSC.SDMode) {
+    return SD.card()->writeSectors(lba, buffer, bufsize / SD_SECTOR_SIZE);
+  }
+
+  if (!g_MSC.lun_unitReady[lun]) {
+    logmsg("Attempted write to non-ready LUN ", lun);
+    return false;
+  }
+
+  g_MSC.lun_config[lun]->file.seek(lba * g_MSC.lun_config[lun]->bytesPerSector);
+  return g_MSC.lun_config[lun]->file.write(buffer, bufsize);
+}
+
 /* TinyUSB mass storage callbacks follow */
 
 // usb framework checks this func exists for mass storage config. no code needed.
@@ -357,6 +421,42 @@ extern "C" int32_t tud_msc_scsi_cb(uint8_t lun, const uint8_t scsi_cmd[16], void
     resplen = 0;
     break;
 
+  case 0x08: { // READ(6)
+    uint32_t lba = ((uint32_t)(scsi_cmd[1] & 0x1F) << 16)
+                 | ((uint32_t)scsi_cmd[2] << 8)
+                 | ((uint32_t)scsi_cmd[3] << 0);
+    uint32_t sector_count = scsi_cmd[4] ? scsi_cmd[4] : 256;
+    uint32_t sector_size = msc_lun_sector_size(lun);
+    uint32_t byte_count = sector_count * sector_size;
+    if (byte_count > bufsize) {
+      byte_count = bufsize;
+    }
+
+    bool ok = msc_read_data(lun, lba, buffer, byte_count);
+    if (ok && MSC_LEDMode == LED_SOLIDON) {
+      MSC_LEDMode = LED_BLINK_FAST;
+    }
+    resplen = ok ? byte_count : -1;
+    break;
+  }
+
+  case 0x0A: { // WRITE(6)
+    uint32_t lba = ((uint32_t)(scsi_cmd[1] & 0x1F) << 16)
+                 | ((uint32_t)scsi_cmd[2] << 8)
+                 | ((uint32_t)scsi_cmd[3] << 0);
+    uint32_t sector_count = scsi_cmd[4] ? scsi_cmd[4] : 256;
+    uint32_t sector_size = msc_lun_sector_size(lun);
+    uint32_t byte_count = sector_count * sector_size;
+    if (byte_count > bufsize) {
+      byte_count = bufsize;
+    }
+
+    bool ok = msc_write_data(lun, lba, (uint8_t*)buffer, byte_count);
+    MSC_LEDMode = LED_BLINK_SLOW;
+    resplen = ok ? byte_count : -1;
+    break;
+  }
+
   default:
     // Set Sense = Invalid Command Operation
     tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x20, 0x00);
@@ -387,18 +487,7 @@ extern "C" int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset,
   MSCScopedLock lock;
   if (g_msc_initiator) return init_msc_read10_cb(lun, lba, offset, buffer, bufsize);
 
-  bool rc = 0;
-
-  if (g_MSC.SDMode) {
-    rc = SD.card()->readSectors(lba, (uint8_t*) buffer, bufsize/SD_SECTOR_SIZE);
-  } else {
-    if (g_MSC.lun_unitReady[lun]) {
-      g_MSC.lun_config[lun]->file.seek(lba * g_MSC.lun_config[lun]->bytesPerSector);
-      rc = g_MSC.lun_config[lun]->file.read(buffer, bufsize);
-    } else {
-      logmsg("Attempted read to non-ready LUN ",lun);
-    }
-  }
+  bool rc = msc_read_data(lun, lba, buffer, bufsize);
 
   // only blink fast on reads; writes will override this
   if (MSC_LEDMode == LED_SOLIDON)
@@ -415,18 +504,7 @@ extern "C" int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset
   MSCScopedLock lock;
   if (g_msc_initiator) return init_msc_write10_cb(lun, lba, offset, buffer, bufsize);
 
-  bool rc = 0;
-
-  if (g_MSC.SDMode) {
-    rc = SD.card()->writeSectors(lba, buffer, bufsize/SD_SECTOR_SIZE); 
-  } else {
-    if (g_MSC.lun_unitReady[lun]) {
-      g_MSC.lun_config[lun]->file.seek(lba * g_MSC.lun_config[lun]->bytesPerSector);
-      rc = g_MSC.lun_config[lun]->file.write(buffer, bufsize);
-    } else {
-      logmsg("Attempted write to non-ready LUN ",lun);
-    }
-  }
+  bool rc = msc_write_data(lun, lba, buffer, bufsize);
 
   // always slow blink
   MSC_LEDMode = LED_BLINK_SLOW;

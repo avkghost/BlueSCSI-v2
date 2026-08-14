@@ -83,7 +83,7 @@ static struct {
     uint8_t initiator_id;
     uint8_t max_retry_count;
     bool use_read10; // Always use read10 commands
-    bool msc_mode;   // USB MSC initiator mode (from config or hardware switch)
+    bool msc_mode;   // USB MSC raw bridge mode (from config or hardware switch)
 
     // Is imaging a drive in progress, or are we scanning?
     bool imaging;
@@ -117,6 +117,16 @@ static struct {
 
     FsFile target_file;
 } g_initiator_state;
+
+static struct {
+    bool valid;
+    uint8_t sense_key;
+    uint8_t sense_asc;
+    uint8_t sense_ascq;
+    bool raw_valid;
+    uint8_t raw_response[18];
+    uint8_t raw_length;
+} g_last_request_sense;
 
 extern SdFs SD;
 
@@ -157,12 +167,15 @@ void scsiInitiatorInit()
     g_initiator_state.eject_when_done = false;
     memset(g_initiator_state.removable_count, 0, sizeof(g_initiator_state.removable_count));
 
-    // Cache MSC mode decision: config takes priority, then hardware switch on Ultra
-    g_initiator_state.msc_mode = ini_getbool("SCSI", "InitiatorMSC", false, CONFIGFILE);
+    // Cache MSC mode decision: Ultra defaults to raw bridge mode unless
+    // explicitly disabled in config; the hardware switch can still force it on.
 #if defined(BLUESCSI_ULTRA) || defined(BLUESCSI_ULTRA_WIDE)
+    g_initiator_state.msc_mode = ini_getbool("SCSI", "InitiatorMSC", true, CONFIGFILE);
     if (!g_initiator_state.msc_mode) {
         g_initiator_state.msc_mode = is_initiator_USB_mode_enabled();
     }
+#else
+    g_initiator_state.msc_mode = ini_getbool("SCSI", "InitiatorMSC", false, CONFIGFILE);
 #endif
 
     // Initiator start sector override
@@ -293,7 +306,7 @@ void scsiInitiatorMainLoop()
                 logmsg("Initiator init delay set in ", CONFIGFILE ," to ", (int)msc_init_delay, " milliseconds");
             platform_delay_ms(msc_init_delay);
 
-            logmsg("Entering USB MSC initiator mode");
+            logmsg("Entering USB MSC raw bridge mode");
             platform_enter_msc();
             setup_msc_initiator();
             return;
@@ -914,11 +927,69 @@ bool scsiRequestSense(int target_id, uint8_t *sense_key, uint8_t *sense_asc, uin
         " sense_key ", (int)(response[2] & 0xF),
         " asc ", response[12], " ascq ", response[13]);
 
+    if (status == 0)
+    {
+        g_last_request_sense.valid = true;
+        g_last_request_sense.sense_key = response[2] & 0xF;
+        g_last_request_sense.sense_asc = response[12];
+        g_last_request_sense.sense_ascq = response[13];
+        g_last_request_sense.raw_valid = true;
+        g_last_request_sense.raw_length = sizeof(response);
+        memcpy(g_last_request_sense.raw_response, response, sizeof(response));
+    }
+    else
+    {
+        g_last_request_sense.valid = false;
+        g_last_request_sense.raw_valid = false;
+        g_last_request_sense.raw_length = 0;
+    }
+
     if (sense_key) *sense_key = response[2] & 0xF;
     if (sense_asc) *sense_asc = response[12];
     if (sense_ascq) *sense_ascq = response[13];
 
     return status == 0;
+}
+
+bool scsiGetLastRequestSense(uint8_t *sense_key, uint8_t *sense_asc, uint8_t *sense_ascq)
+{
+    if (!g_last_request_sense.valid)
+    {
+        return false;
+    }
+
+    if (sense_key) *sense_key = g_last_request_sense.sense_key;
+    if (sense_asc) *sense_asc = g_last_request_sense.sense_asc;
+    if (sense_ascq) *sense_ascq = g_last_request_sense.sense_ascq;
+    return true;
+}
+
+bool scsiTakeLastRequestSenseRaw(uint8_t *buffer, uint16_t bufsize, uint16_t *response_len)
+{
+    if (!g_last_request_sense.raw_valid)
+    {
+        return false;
+    }
+
+    uint16_t len = g_last_request_sense.raw_length;
+    if (len > bufsize)
+    {
+        len = bufsize;
+    }
+
+    memcpy(buffer, g_last_request_sense.raw_response, len);
+    if (response_len) *response_len = len;
+
+    g_last_request_sense.raw_valid = false;
+    g_last_request_sense.raw_length = 0;
+    return true;
+}
+
+void scsiClearLastRequestSense()
+{
+    g_last_request_sense.valid = false;
+    g_last_request_sense.raw_valid = false;
+    g_last_request_sense.raw_length = 0;
 }
 
 // Execute UNIT START STOP command to load/unload media

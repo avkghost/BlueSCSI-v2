@@ -74,6 +74,15 @@ bool scsiInitiatorReadCapacity(int target_id, uint32_t *sectorcount, uint32_t *s
 // Execute REQUEST SENSE command to get more information about error status
 bool scsiRequestSense(int target_id, uint8_t *sense_key, uint8_t *sense_asc = nullptr, uint8_t *sense_ascq = nullptr);
 
+// Return the most recent REQUEST SENSE response captured by scsiRequestSense().
+bool scsiGetLastRequestSense(uint8_t *sense_key, uint8_t *sense_asc = nullptr, uint8_t *sense_ascq = nullptr);
+
+// Copy the most recent raw REQUEST SENSE response into buffer and consume it.
+bool scsiTakeLastRequestSenseRaw(uint8_t *buffer, uint16_t bufsize, uint16_t *response_len = nullptr);
+
+// Forget any cached REQUEST SENSE response.
+void scsiClearLastRequestSense();
+
 // Execute UNIT START STOP command to load/unload media
 bool scsiStartStopUnit(int target_id, bool start);
 
