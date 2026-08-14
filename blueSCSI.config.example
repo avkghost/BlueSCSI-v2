@@ -1,0 +1,69 @@
+; Example BlueSCSI configuration. Copy to bluescsi.ini on the SD card root.
+; Most keys here are optional -- defaults are shown. Values are parsed from the
+; [SCSI] section of bluescsi.ini.
+
+; ---------------------------------------------------------------------------
+; SCSI initiator mode
+; ---------------------------------------------------------------------------
+; The initiator lets the BlueSCSI act as a SCSI *host* towards another SCSI
+; device.  Three modes:
+;   off        (0 / off / false / disabled)  initiator disabled (default)
+;   imaging    (1 / on / true / normal / imaging)
+;              classic initiator: image/copy data between another SCSI drive
+;              and the SD card (device filesystem)
+;   raw-bridge (raw-bridge / rawbridge / bridge / msc)
+;              USB MSC raw bridge: the BlueSCSI connects to a PC over USB as a
+;              mass-storage device and SCSI as an initiator to a target on the
+;              SCSI bus.  When a network target (Type = 6 / AmigaWIFI, Type = 8)
+;              is present on that bus, the PC sees the DaynaPORT SCSI/Link
+;              network adapter and gets Ethernet over USB.
+;
+; Resolution order:
+;   1. explicit SCSI/InitiatorMode key (below) wins,
+;   2. else Ultra/Ultra-Wide hardware initiator switch forces imaging mode,
+;   3. else legacy SCSI/InitiatorMSC=true selects raw-bridge mode.
+; Unknown values log a warning and fall back to off.
+[SCSI]
+; InitiatorMode = off
+; InitiatorMode = imaging
+InitiatorMode = raw-bridge
+
+; SCSI parity for the initiator side. Leave true unless your target has a
+; marginal parity implementation.
+; InitiatorParity = true
+
+; Legacy boolean that historically selected USB MSC raw-bridge mode on the
+; Ultra.  New configs should use InitiatorMode = raw-bridge instead.
+; InitiatorMSC = false
+
+; --- raw-bridge (MSC) tuning ------------------------------------------------
+; Block read-ahead (prefetch) depth in sectors for MSC reads.
+; InitiatorMSCPrefetchSectors = 32
+; Disable read-ahead entirely.
+; InitiatorMSCDisablePrefetch = false
+; How often (ms) the BlueSCSI logs MSC status while a transfer is active.
+; InitiatorMSCStatusInterval = 5000
+; Refuse host write requests (expose the target read-only over USB).
+; InitiatorMSCReadOnly = false
+; Delay (ms) before MSC callbacks are processed after initiator start, so the
+; USB serial console can connect.
+; InitiatorMSCInitDelay = 1000
+
+; ---------------------------------------------------------------------------
+; DaynaPORT network bridge target
+; ---------------------------------------------------------------------------
+; To serve a DaynaPORT SCSI/Link (Ethernet over SCSI) adapter to a SCSI *host*,
+; configure a network device on that host's SCSI ID.  The driver exposes it to
+; USB in raw-bridge initiator mode (above) as a SCSI processor device.
+;
+; The section index is the SCSI ID: [Device0] = SCSI ID 0.
+[Device0]
+Type = 6                ; S2S_CFG_NETWORK: DaynaPORT SCSI/Link
+; Optional vendor/product/rev; defaults are "Dayna" / "SCSI/Link" / "2.0f".
+; Vendor = Dayna
+; Product = SCSI/Link
+; Revision = 2.0f
+
+; AmigaWIFI-compatible variant:
+; [Device1]
+; Type = 8                ; S2S_CFG_AMIGAWIFI

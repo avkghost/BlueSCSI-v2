@@ -43,11 +43,18 @@ enum scsi_device_type_t {
     SCSI_DEVICE_TYPE_UNKNOWN = 0x1F
 };
 
+enum scsi_initiator_mode_t {
+    SCSI_INITIATOR_MODE_OFF = 0,
+    SCSI_INITIATOR_MODE_IMAGING,
+    SCSI_INITIATOR_MODE_RAW_BRIDGE
+};
+
 #define INITIATOR_IMAGE_SKIP_IF_EXISTS 0
 #define INITIATOR_IMAGE_INCREMENT_IF_EXISTS 1
 #define INITIATOR_IMAGE_OVERWRITE_IF_EXISTS 2
 
 void scsiInitiatorInit();
+scsi_initiator_mode_t scsiInitiatorConfigMode();
 
 void scsiInitiatorMainLoop();
 

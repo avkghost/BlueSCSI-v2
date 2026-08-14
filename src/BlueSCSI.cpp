@@ -1005,7 +1005,7 @@ STATIC_TESTABLE void reinitSCSI()
 
     // Error if there are 0 image files
     if (!scsiDiskCheckAnyImagesConfigured() &&
-        !ini_getbool("SCSI", "InitiatorMode", false, CONFIGFILE))
+        scsiInitiatorConfigMode() == SCSI_INITIATOR_MODE_OFF)
     {
   #ifdef RAW_FALLBACK_ENABLE
       logmsg("No images found, enabling RAW fallback partition");
@@ -1401,18 +1401,18 @@ STATIC_TESTABLE void bluescsi_setup_sd_card(bool wait_for_card = true)
 #endif
   }
 #ifdef PLATFORM_HAS_INITIATOR_MODE
-  bool initiator_mode = ini_getbool("SCSI", "InitiatorMode", false, CONFIGFILE);
-#if defined(BLUESCSI_ULTRA) || defined(BLUESCSI_ULTRA_WIDE)
-  // If Initiator Mode is already configured via SD card, leave it on
-  // Otherwise check the hardware switch and enable if set
-  if (!initiator_mode) {
-    initiator_mode = is_initiator_mode_enabled();
-  }
-#endif
-  if (initiator_mode)
+  scsi_initiator_mode_t initiator_mode = scsiInitiatorConfigMode();
+  if (initiator_mode != SCSI_INITIATOR_MODE_OFF)
   {
     if (platform_supports_initiator_mode()) {
-      logmsg("SCSI Initiator Mode");
+      if (initiator_mode == SCSI_INITIATOR_MODE_RAW_BRIDGE)
+      {
+        logmsg("SCSI Initiator Mode: raw bridge");
+      }
+      else
+      {
+        logmsg("SCSI Initiator Mode: imaging");
+      }
       platform_enable_initiator_mode();
       reinitSCSI();
       if (! ini_getbool("SCSI", "InitiatorParity", true, CONFIGFILE))

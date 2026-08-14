@@ -43,6 +43,7 @@
 extern "C" {
 #include <scsi.h>
 }
+#include <strings.h>
 
 #ifndef PLATFORM_HAS_INITIATOR_MODE
 
@@ -66,6 +67,11 @@ bool scsiInitiatorReadCapacity(int target_id, uint32_t *sectorcount, uint32_t *s
     return false;
 }
 
+scsi_initiator_mode_t scsiInitiatorConfigMode()
+{
+    return SCSI_INITIATOR_MODE_OFF;
+}
+
 #else
 
 // From BlueSCSI.cpp
@@ -83,7 +89,7 @@ static struct {
     uint8_t initiator_id;
     uint8_t max_retry_count;
     bool use_read10; // Always use read10 commands
-    bool msc_mode;   // USB MSC raw bridge mode (from config or hardware switch)
+    scsi_initiator_mode_t mode;   // Initiator mode selected from config/hardware
 
     // Is imaging a drive in progress, or are we scanning?
     bool imaging;
@@ -117,6 +123,66 @@ static struct {
 
     FsFile target_file;
 } g_initiator_state;
+
+static scsi_initiator_mode_t parse_initiator_mode_value(const char *value)
+{
+    if (value == nullptr || value[0] == '\0')
+    {
+        return SCSI_INITIATOR_MODE_OFF;
+    }
+
+    if (strcasecmp(value, "0") == 0 ||
+        strcasecmp(value, "off") == 0 ||
+        strcasecmp(value, "false") == 0 ||
+        strcasecmp(value, "disabled") == 0)
+    {
+        return SCSI_INITIATOR_MODE_OFF;
+    }
+
+    if (strcasecmp(value, "1") == 0 ||
+        strcasecmp(value, "on") == 0 ||
+        strcasecmp(value, "true") == 0 ||
+        strcasecmp(value, "normal") == 0 ||
+        strcasecmp(value, "imaging") == 0)
+    {
+        return SCSI_INITIATOR_MODE_IMAGING;
+    }
+
+    if (strcasecmp(value, "raw-bridge") == 0 ||
+        strcasecmp(value, "rawbridge") == 0 ||
+        strcasecmp(value, "bridge") == 0 ||
+        strcasecmp(value, "msc") == 0)
+    {
+        return SCSI_INITIATOR_MODE_RAW_BRIDGE;
+    }
+
+    logmsg("Unknown InitiatorMode value \"", value, "\", defaulting to off");
+    return SCSI_INITIATOR_MODE_OFF;
+}
+
+scsi_initiator_mode_t scsiInitiatorConfigMode()
+{
+    char mode_value[32] = {0};
+    if (ini_haskey("SCSI", "InitiatorMode", CONFIGFILE))
+    {
+        ini_gets("SCSI", "InitiatorMode", "", mode_value, sizeof(mode_value), CONFIGFILE);
+        return parse_initiator_mode_value(mode_value);
+    }
+
+#if defined(BLUESCSI_ULTRA) || defined(BLUESCSI_ULTRA_WIDE)
+    if (is_initiator_mode_enabled())
+    {
+        return SCSI_INITIATOR_MODE_IMAGING;
+    }
+#endif
+
+    if (ini_getbool("SCSI", "InitiatorMSC", false, CONFIGFILE))
+    {
+        return SCSI_INITIATOR_MODE_RAW_BRIDGE;
+    }
+
+    return SCSI_INITIATOR_MODE_OFF;
+}
 
 static struct {
     bool valid;
@@ -170,12 +236,9 @@ void scsiInitiatorInit()
     // Cache MSC mode decision: Ultra defaults to raw bridge mode unless
     // explicitly disabled in config; the hardware switch can still force it on.
 #if defined(BLUESCSI_ULTRA) || defined(BLUESCSI_ULTRA_WIDE)
-    g_initiator_state.msc_mode = ini_getbool("SCSI", "InitiatorMSC", true, CONFIGFILE);
-    if (!g_initiator_state.msc_mode) {
-        g_initiator_state.msc_mode = is_initiator_USB_mode_enabled();
-    }
+    g_initiator_state.mode = scsiInitiatorConfigMode();
 #else
-    g_initiator_state.msc_mode = ini_getbool("SCSI", "InitiatorMSC", false, CONFIGFILE);
+    g_initiator_state.mode = scsiInitiatorConfigMode();
 #endif
 
     // Initiator start sector override
@@ -204,7 +267,7 @@ int scsiInitiatorGetOwnID()
 #ifdef UNIT_TEST
 bool scsiInitiatorGetMscMode()
 {
-    return g_initiator_state.msc_mode;
+    return g_initiator_state.mode == SCSI_INITIATOR_MODE_RAW_BRIDGE;
 }
 #endif
 
@@ -297,7 +360,7 @@ void scsiInitiatorMainLoop()
     }
     else
     {
-        if (g_initiator_state.msc_mode)
+        if (g_initiator_state.mode == SCSI_INITIATOR_MODE_RAW_BRIDGE)
         {
             // This delay allows the USB serial console to connect immediately to the host
             // It also decreases the delay in callback processing of MSC commands
