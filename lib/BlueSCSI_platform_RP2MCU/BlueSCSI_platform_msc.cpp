@@ -297,6 +297,35 @@ static bool msc_write_data(uint8_t lun, uint32_t lba, uint8_t* buffer, uint32_t 
   return g_MSC.lun_config[lun]->file.write(buffer, bufsize);
 }
 
+static uint8_t msc_inquiry_device_type_for_lun(uint8_t lun)
+{
+  if (g_msc_initiator) {
+    return init_msc_inquiry_device_type_cb(lun);
+  }
+
+  if (g_MSC.SDMode || lun >= g_MSC.lun_count || g_MSC.lun_config[lun] == nullptr) {
+    return SCSI_DEVICE_TYPE_DIRECT_ACCESS;
+  }
+
+  switch (g_MSC.lun_config[lun]->deviceType) {
+    case S2S_CFG_NETWORK:
+    case S2S_CFG_AMIGAWIFI:
+      return SCSI_DEVICE_TYPE_PROCESSOR;
+
+    case S2S_CFG_SEQUENTIAL:
+      return SCSI_DEVICE_TYPE_SEQUENTIAL;
+
+    case S2S_CFG_PRINTER:
+      return SCSI_DEVICE_TYPE_PRINTER;
+
+    case S2S_CFG_OPTICAL:
+      return SCSI_DEVICE_TYPE_CD;
+
+    default:
+      return SCSI_DEVICE_TYPE_DIRECT_ACCESS;
+  }
+}
+
 /* TinyUSB mass storage callbacks follow */
 
 // usb framework checks this func exists for mass storage config. no code needed.
@@ -308,7 +337,10 @@ extern "C" void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8],
                         uint8_t product_id[16], uint8_t product_rev[4]) {
 
   MSCScopedLock lock;
-  if (g_msc_initiator) return init_msc_inquiry_cb(lun, vendor_id, product_id, product_rev);
+  if (g_msc_initiator) {
+    init_msc_inquiry_cb(lun, vendor_id, product_id, product_rev);
+    return;
+  }
 
   const char vid[] = "BlueSCSI";
   const char pid[] = PLATFORM_PID; 
@@ -317,6 +349,12 @@ extern "C" void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8],
   memcpy(vendor_id, vid, tu_min32(strlen(vid), 8));
   memcpy(product_id, pid, tu_min32(strlen(pid), 16));
   memcpy(product_rev, rev, tu_min32(strlen(rev), 4));
+}
+
+extern "C" uint8_t tud_msc_inquiry_device_type_cb(uint8_t lun)
+{
+  MSCScopedLock lock;
+  return msc_inquiry_device_type_for_lun(lun);
 }
 
 // max LUN supported

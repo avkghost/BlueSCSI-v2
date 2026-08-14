@@ -30,7 +30,13 @@
 #include "BlueSCSI_log.h"
 #include "BlueSCSI_log_trace.h"
 #include "BlueSCSI_initiator.h"
+#include "BlueSCSI_settings.h"
 #include "BlueSCSI_platform_msc.h"
+#ifdef BLUESCSI_NETWORK
+#include "network.h"
+extern bool scsiNetworkEnabled;
+extern struct scsiNetworkPacketQueue scsiNetworkInboundQueue;
+#endif
 #include <scsi.h>
 #include <BlueSCSI_platform.h>
 #include <minIni.h>
@@ -44,6 +50,8 @@ bool setup_msc_initiator() { return false; }
 void poll_msc_initiator() {}
 
 void init_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[16], uint8_t product_rev[4]) {}
+uint8_t init_msc_inquiry_device_type_cb(uint8_t lun) { (void)lun; return SCSI_DEVICE_TYPE_DIRECT_ACCESS; }
+bool init_msc_inquiry_is_removable_cb(uint8_t lun) { (void)lun; return false; }
 uint8_t init_msc_get_maxlun_cb(void) { return 0; }
 bool init_msc_is_writable_cb (uint8_t lun) { return false; }
 bool init_msc_start_stop_cb(uint8_t lun, uint8_t power_condition, bool start, bool load_eject) { return false; }
@@ -59,6 +67,7 @@ void init_msc_write10_complete_cb(uint8_t lun) {}
 // If there are multiple SCSI devices connected, they are mapped into LUNs for host.
 static struct {
     int target_id;
+    int config_device_index;
     uint32_t sectorsize;
     uint32_t sectorcount;
     bool use_read10; // Always use read10/write10 commands for this target
@@ -67,6 +76,7 @@ static struct {
     bool media_ready; // Cached TEST UNIT READY state for refresh gating
     uint8_t device_type; // Peripheral device type from INQUIRY byte 0
     bool is_removable;   // RMB bit from INQUIRY byte 1
+    bool bridge_network; // Synthetic DaynaPORT/AmigaWIFI target from config
 } g_msc_initiator_targets[NUM_SCSIID];
 static int g_msc_initiator_target_count;
 
@@ -115,6 +125,17 @@ static int get_target(uint8_t lun);
 static int do_read6_or_10(int target_id, uint32_t start_sector, uint32_t sectorcount, uint32_t sectorsize, void *buffer, bool use_read10);
 static int do_write6_or_10(int target_id, uint32_t start_sector, uint32_t sectorcount, uint32_t sectorsize, const uint8_t *buffer, bool use_write10);
 static void scan_targets();
+static bool bridge_network_is_lun(uint8_t lun);
+static int32_t bridge_network_scsi_cb(uint8_t lun, const uint8_t scsi_cmd[16], void *buffer, uint16_t bufsize);
+static void fill_network_inquiry(uint8_t vendor_id[8], uint8_t product_id[16], uint8_t product_rev[4], int config_device_index);
+#ifdef BLUESCSI_NETWORK
+static int find_bridge_network_device();
+static bool bridge_network_device_present();
+#else
+static bool bridge_network_is_lun(uint8_t) { return false; }
+static int32_t bridge_network_scsi_cb(uint8_t, const uint8_t[16], void *, uint16_t) { return -1; }
+static void fill_network_inquiry(uint8_t[8], uint8_t[16], uint8_t[4], int) {}
+#endif
 
 static const char *msc_device_type_name(uint8_t device_type)
 {
@@ -151,6 +172,321 @@ static bool msc_device_supports_block_io(uint8_t device_type)
             return false;
     }
 }
+
+#ifdef BLUESCSI_NETWORK
+static int find_bridge_network_device()
+{
+    for (int i = 0; i < NUM_SCSIID; i++)
+    {
+        auto *cfg = g_scsi_settings.getDevice(i);
+        if (cfg->deviceType == S2S_CFG_NETWORK || cfg->deviceType == S2S_CFG_AMIGAWIFI)
+        {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static bool bridge_network_device_present()
+{
+    if (!platform_network_supported())
+    {
+        return false;
+    }
+    return find_bridge_network_device() >= 0;
+}
+
+static void fill_fixed_field(char *dst, size_t dst_len, const char *src)
+{
+    memset(dst, ' ', dst_len);
+    if (src == nullptr)
+    {
+        return;
+    }
+    size_t copy_len = strlen(src);
+    if (copy_len > dst_len)
+    {
+        copy_len = dst_len;
+    }
+    memcpy(dst, src, copy_len);
+}
+
+static void fill_network_inquiry(uint8_t vendor_id[8], uint8_t product_id[16], uint8_t product_rev[4], int config_device_index)
+{
+    const auto *cfg = g_scsi_settings.getDevice(config_device_index);
+    fill_fixed_field((char *)vendor_id, 8, cfg->vendor[0] ? cfg->vendor : "Dayna");
+    fill_fixed_field((char *)product_id, 16, cfg->prodId[0] ? cfg->prodId : "SCSI/Link");
+    fill_fixed_field((char *)product_rev, 4, cfg->revision[0] ? cfg->revision : "2.0f");
+}
+
+static bool bridge_network_is_lun(uint8_t lun)
+{
+    return lun < g_msc_initiator_target_count &&
+           g_msc_initiator_targets[lun].bridge_network;
+}
+
+static const char *bridge_network_command_name(uint8_t opcode)
+{
+    switch (opcode)
+    {
+        case 0x08: return "READ(6)";
+        case 0x09: return "MAC+STATS";
+        case 0x0A: return "WRITE(6)";
+        case 0x0C: return "SET INTERFACE MODE";
+        case 0x0D: return "ADD MULTICAST";
+        case 0x0E: return "TOGGLE INTERFACE";
+        case 0x1A: return "MODE SENSE";
+        case 0x40: return "SET MAC";
+        case 0x80: return "SET MODE";
+        case SCSI_NETWORK_WIFI_CMD: return "WIFI CMD";
+        default: return "UNKNOWN";
+    }
+}
+
+static int32_t bridge_network_read(uint8_t *buffer, uint16_t bufsize, uint32_t size, uint8_t cdb5)
+{
+    const size_t header_len = 6;
+
+    if (bufsize < header_len)
+    {
+        return -1;
+    }
+
+    if (scsiNetworkInboundQueue.readIndex == scsiNetworkInboundQueue.writeIndex)
+    {
+        memset(buffer, 0, header_len);
+        return header_len;
+    }
+
+    uint8_t idx = scsiNetworkInboundQueue.readIndex;
+    uint16_t packet_len = scsiNetworkInboundQueue.sizes[idx];
+    if (packet_len > 4)
+    {
+        packet_len -= 4;
+    }
+
+    uint32_t total_len = header_len + packet_len;
+    if (total_len > bufsize)
+    {
+        return -1;
+    }
+
+    buffer[0] = (packet_len >> 8) & 0xff;
+    buffer[1] = packet_len & 0xff;
+    buffer[2] = 0;
+    buffer[3] = 0;
+    buffer[4] = 0;
+    buffer[5] = 0;
+
+    memcpy(buffer + header_len, scsiNetworkInboundQueue.packets[idx], packet_len);
+    if (scsiNetworkInboundQueue.readIndex == NETWORK_PACKET_QUEUE_SIZE - 1)
+    {
+        scsiNetworkInboundQueue.readIndex = 0;
+    }
+    else
+    {
+        scsiNetworkInboundQueue.readIndex++;
+    }
+
+    (void)size;
+    (void)cdb5;
+    return (int32_t)total_len;
+}
+
+static int32_t bridge_network_write(const uint8_t *buffer, uint16_t bufsize, uint32_t size, uint8_t cdb5)
+{
+    if (cdb5 == 0x00)
+    {
+        if (size > bufsize)
+        {
+            size = bufsize;
+        }
+        return platform_network_send((uint8_t *)buffer, size) == 0 ? (int32_t)size : -1;
+    }
+
+    uint32_t pos = 0;
+    while (pos + 4 <= bufsize)
+    {
+        uint32_t packet_size = ((uint32_t)buffer[pos] << 8) | buffer[pos + 1];
+        pos += 4;
+        if (packet_size == 0)
+        {
+            break;
+        }
+        if (pos + packet_size > bufsize)
+        {
+            break;
+        }
+        platform_network_send((uint8_t *)(buffer + pos), packet_size);
+        pos += packet_size;
+    }
+
+    (void)size;
+    return (int32_t)pos;
+}
+
+static int32_t bridge_network_wifi_command(uint8_t lun, const uint8_t scsi_cmd[16], void *buffer, uint16_t bufsize)
+{
+    uint8_t *out = (uint8_t *)buffer;
+    const uint32_t size = ((uint32_t)scsi_cmd[3] << 8) | scsi_cmd[4];
+
+    switch (scsi_cmd[1])
+    {
+        case SCSI_NETWORK_WIFI_CMD_SCAN:
+        {
+            out[0] = platform_network_wifi_start_scan() < 0 ? 0 : 1;
+            return 1;
+        }
+        case SCSI_NETWORK_WIFI_CMD_COMPLETE:
+        {
+            out[0] = platform_network_wifi_scan_finished() ? 1 : 0;
+            return 1;
+        }
+        case SCSI_NETWORK_WIFI_CMD_SCAN_RESULTS:
+        {
+            if (!platform_network_wifi_scan_finished() || size < 2)
+            {
+                platform_msc_set_sense(lun, ILLEGAL_REQUEST, 0x24, 0x00);
+                return -1;
+            }
+            int nets = 0;
+            for (int i = 0; i < WIFI_NETWORK_LIST_ENTRY_COUNT; i++)
+            {
+                if (wifi_network_list[i].ssid[0] == '\0')
+                {
+                    break;
+                }
+                nets++;
+            }
+            uint32_t netsize = sizeof(struct wifi_network_entry) * nets;
+            if (netsize + 2 > bufsize)
+            {
+                netsize = bufsize > 2 ? (bufsize - 2) : 0;
+                netsize -= netsize % sizeof(struct wifi_network_entry);
+            }
+            if (netsize + 2 > size)
+            {
+                netsize = size > 2 ? (size - 2) : 0;
+                netsize -= netsize % sizeof(struct wifi_network_entry);
+            }
+            out[0] = (netsize >> 8) & 0xff;
+            out[1] = netsize & 0xff;
+            if (netsize)
+            {
+                memcpy(out + 2, wifi_network_list, netsize);
+            }
+            return (int32_t)(netsize + 2);
+        }
+        case SCSI_NETWORK_WIFI_CMD_INFO:
+        {
+            struct wifi_network_entry wifi_cur = { 0 };
+            char *ssid = platform_network_wifi_ssid();
+            if (ssid != nullptr)
+            {
+                strlcpy(wifi_cur.ssid, ssid, sizeof(wifi_cur.ssid));
+            }
+            char *bssid = platform_network_wifi_bssid();
+            if (bssid != nullptr)
+            {
+                memcpy(wifi_cur.bssid, bssid, sizeof(wifi_cur.bssid));
+            }
+            wifi_cur.rssi = platform_network_wifi_rssi();
+            wifi_cur.channel = platform_network_wifi_channel();
+            if (bufsize < sizeof(wifi_cur) + 2)
+            {
+                return -1;
+            }
+            out[0] = (sizeof(wifi_cur) >> 8) & 0xff;
+            out[1] = sizeof(wifi_cur) & 0xff;
+            memcpy(out + 2, &wifi_cur, sizeof(wifi_cur));
+            return (int32_t)(sizeof(wifi_cur) + 2);
+        }
+        case SCSI_NETWORK_WIFI_CMD_JOIN:
+        {
+            if (size != sizeof(struct wifi_join_request) || bufsize < size)
+            {
+                platform_msc_set_sense(lun, ILLEGAL_REQUEST, 0x24, 0x00);
+                return -1;
+            }
+            const struct wifi_join_request *req = (const struct wifi_join_request *)buffer;
+            platform_network_wifi_join((char *)req->ssid, (char *)req->key, false);
+            return 0;
+        }
+        default:
+            platform_msc_set_sense(lun, ILLEGAL_REQUEST, 0x20, 0x00);
+            return -1;
+    }
+}
+
+static int32_t bridge_network_scsi_cb(uint8_t lun, const uint8_t scsi_cmd[16], void *buffer, uint16_t bufsize)
+{
+    const uint32_t size = ((uint32_t)scsi_cmd[3] << 8) | scsi_cmd[4];
+    uint8_t *out = (uint8_t *)buffer;
+
+    logmsg("DaynaPORT bridge LUN ", (int)lun,
+           " handling opcode 0x", bytearray(&scsi_cmd[0], 1),
+           " (", bridge_network_command_name(scsi_cmd[0]), ") size ", (int)size);
+
+    switch (scsi_cmd[0])
+    {
+        case 0x08: // READ(6)
+            logmsg("DaynaPORT bridge READ(6): buffer ", (int)bufsize, " bytes, cdb5=0x", bytearray(&scsi_cmd[5], 1));
+            return bridge_network_read(out, bufsize, size, scsi_cmd[5]);
+
+        case 0x09: // MAC + counters
+            logmsg("DaynaPORT bridge MAC+STATS request");
+            if (bufsize < 18)
+            {
+                return -1;
+            }
+            memcpy(out, scsiDev.boardCfg.wifiMACAddress, sizeof(scsiDev.boardCfg.wifiMACAddress));
+            memset(out + sizeof(scsiDev.boardCfg.wifiMACAddress), 0, 18 - sizeof(scsiDev.boardCfg.wifiMACAddress));
+            return 18;
+
+        case 0x0A: // WRITE(6)
+            logmsg("DaynaPORT bridge WRITE(6): buffer ", (int)bufsize, " bytes, cdb5=0x", bytearray(&scsi_cmd[5], 1));
+            return bridge_network_write((const uint8_t *)buffer, bufsize, size, scsi_cmd[5]);
+
+        case 0x0D:
+            logmsg("DaynaPORT bridge ADD MULTICAST");
+            if (size > bufsize)
+            {
+                return -1;
+            }
+            platform_network_add_multicast_address((uint8_t *)buffer);
+            return 0;
+
+        case 0x0E:
+            logmsg("DaynaPORT bridge TOGGLE INTERFACE: ", (scsi_cmd[5] & 0x80) ? "enable" : "disable");
+            if (scsi_cmd[5] & 0x80)
+            {
+                scsiNetworkEnabled = true;
+                memset(&scsiNetworkInboundQueue, 0, sizeof(scsiNetworkInboundQueue));
+            }
+            else
+            {
+                scsiNetworkEnabled = false;
+            }
+            return 0;
+
+        case 0x1A:
+            logmsg("DaynaPORT bridge MODE SENSE (ignored)");
+        case 0x40:
+            if (scsi_cmd[0] == 0x40) logmsg("DaynaPORT bridge SET MAC (ignored)");
+        case 0x80:
+            if (scsi_cmd[0] == 0x80) logmsg("DaynaPORT bridge SET MODE (ignored)");
+            return 0;
+
+        case SCSI_NETWORK_WIFI_CMD:
+            logmsg("DaynaPORT bridge WIFI CMD subcommand 0x", bytearray(&scsi_cmd[1], 1));
+            return bridge_network_wifi_command(lun, scsi_cmd, buffer, bufsize);
+
+        default:
+            platform_msc_set_sense(lun, ILLEGAL_REQUEST, 0x20, 0x00);
+            return -1;
+    }
+}
+#endif
 
 static void refresh_target_writable_cache(uint8_t lun)
 {
@@ -257,11 +593,13 @@ static void scan_targets()
         uint8_t device_type = inquiry_data[0] & 0x1F;
         bool is_removable = (inquiry_data[1] & 0x80) != 0;
         g_msc_initiator_targets[found_count].target_id = target_id;
+        g_msc_initiator_targets[found_count].config_device_index = -1;
         g_msc_initiator_targets[found_count].device_type = device_type;
         g_msc_initiator_targets[found_count].is_removable = is_removable;
         g_msc_initiator_targets[found_count].block_io_supported = msc_device_supports_block_io(device_type);
         g_msc_initiator_targets[found_count].writable = false;
         g_msc_initiator_targets[found_count].media_ready = false;
+        g_msc_initiator_targets[found_count].bridge_network = false;
         const char *type_name = msc_device_type_name(device_type);
 
         bool ready = scsiTestUnitReady(target_id);
@@ -327,6 +665,32 @@ static void scan_targets()
         }
         found_count++;
     }
+
+#ifdef BLUESCSI_NETWORK
+    if (found_count < NUM_SCSIID && bridge_network_device_present())
+    {
+        int config_device_index = find_bridge_network_device();
+        if (config_device_index >= 0)
+        {
+            g_msc_initiator_targets[found_count].target_id = -1;
+            g_msc_initiator_targets[found_count].config_device_index = config_device_index;
+            g_msc_initiator_targets[found_count].device_type = SCSI_DEVICE_TYPE_PROCESSOR;
+            g_msc_initiator_targets[found_count].is_removable = false;
+            g_msc_initiator_targets[found_count].block_io_supported = false;
+            g_msc_initiator_targets[found_count].writable = false;
+            g_msc_initiator_targets[found_count].media_ready = true;
+            g_msc_initiator_targets[found_count].sectorcount = 0;
+            g_msc_initiator_targets[found_count].sectorsize = 0;
+            g_msc_initiator_targets[found_count].use_read10 = true;
+            g_msc_initiator_targets[found_count].bridge_network = true;
+            logmsg("Found configured network device in bridge mode: ",
+                   g_scsi_settings.getDevice(config_device_index)->vendor, " ",
+                   g_scsi_settings.getDevice(config_device_index)->prodId,
+                   " (", msc_device_type_name(SCSI_DEVICE_TYPE_PROCESSOR), ")");
+            found_count++;
+        }
+    }
+#endif
 
     // USB MSC requests can start processing after we set this
     g_msc_initiator_target_count = found_count;
@@ -482,6 +846,13 @@ void init_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[1
         return;
     }
 
+    if (bridge_network_is_lun(lun))
+    {
+        fill_network_inquiry(vendor_id, product_id, product_rev,
+                             g_msc_initiator_targets[lun].config_device_index);
+        return;
+    }
+
     LED_ON();
     g_msc_initiator_state.status_reqcount++;
 
@@ -498,6 +869,46 @@ void init_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[1
     memcpy(product_rev, &response[32], 4);
 
     LED_OFF();
+}
+
+uint8_t init_msc_inquiry_device_type_cb(uint8_t lun)
+{
+    if (!ensure_targets_scanned())
+    {
+        return SCSI_DEVICE_TYPE_DIRECT_ACCESS;
+    }
+
+    if (lun >= g_msc_initiator_target_count)
+    {
+        return SCSI_DEVICE_TYPE_DIRECT_ACCESS;
+    }
+
+    if (bridge_network_is_lun(lun))
+    {
+        return SCSI_DEVICE_TYPE_PROCESSOR;
+    }
+
+    return g_msc_initiator_targets[lun].device_type;
+}
+
+bool init_msc_inquiry_is_removable_cb(uint8_t lun)
+{
+    if (!ensure_targets_scanned())
+    {
+        return false;
+    }
+
+    if (lun >= g_msc_initiator_target_count)
+    {
+        return false;
+    }
+
+    if (bridge_network_is_lun(lun))
+    {
+        return false;
+    }
+
+    return is_removable_device(lun);
 }
 
 uint8_t init_msc_get_maxlun_cb(void)
@@ -523,6 +934,11 @@ bool init_msc_is_writable_cb (uint8_t lun)
         return false;
     }
 
+    if (bridge_network_is_lun(lun))
+    {
+        return false;
+    }
+
     if (!g_msc_initiator_targets[lun].block_io_supported)
     {
         return false;
@@ -543,6 +959,11 @@ bool init_msc_start_stop_cb(uint8_t lun, uint8_t power_condition, bool start, bo
     if (g_msc_initiator_target_count == 0)
     {
         return false;
+    }
+
+    if (bridge_network_is_lun(lun))
+    {
+        return true;
     }
 
     LED_ON();
@@ -599,6 +1020,11 @@ bool init_msc_test_unit_ready_cb(uint8_t lun)
         return false;
     }
 
+    if (bridge_network_is_lun(lun))
+    {
+        return true;
+    }
+
     g_msc_initiator_state.status_reqcount++;
     scsiClearLastRequestSense();
     bool ready = scsiTestUnitReady(get_target(lun));
@@ -641,6 +1067,13 @@ void init_msc_capacity_cb(uint8_t lun, uint32_t *block_count, uint16_t *block_si
         return;
     }
 
+    if (bridge_network_is_lun(lun))
+    {
+        *block_count = 0;
+        *block_size = 0;
+        return;
+    }
+
     uint32_t sectorcount = 0;
     uint32_t sectorsize = 0;
     bool success = scsiInitiatorReadCapacity(get_target(lun), &sectorcount, &sectorsize);
@@ -673,6 +1106,15 @@ int32_t init_msc_scsi_cb(uint8_t lun, const uint8_t scsi_cmd[16], void *buffer, 
     if (g_msc_initiator_target_count == 0)
     {
         return -1;
+    }
+
+    if (bridge_network_is_lun(lun))
+    {
+#ifdef BLUESCSI_NETWORK
+        return bridge_network_scsi_cb(lun, scsi_cmd, buffer, bufsize);
+#else
+        return -1;
+#endif
     }
 
     dbgmsg("-- MSC Raw SCSI command ", bytearray(scsi_cmd, 16));

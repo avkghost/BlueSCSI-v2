@@ -33,6 +33,8 @@ bool setup_msc_initiator();
 void poll_msc_initiator();
 
 void init_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[16], uint8_t product_rev[4]);
+uint8_t init_msc_inquiry_device_type_cb(uint8_t lun);
+bool init_msc_inquiry_is_removable_cb(uint8_t lun);
 uint8_t init_msc_get_maxlun_cb(void);
 bool init_msc_is_writable_cb (uint8_t lun);
 bool init_msc_start_stop_cb(uint8_t lun, uint8_t power_condition, bool start, bool load_eject);
@@ -42,5 +44,4 @@ int32_t init_msc_scsi_cb(uint8_t lun, const uint8_t scsi_cmd[16], void *buffer, 
 int32_t init_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void* buffer, uint32_t bufsize);
 int32_t init_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t *buffer, uint32_t bufsize);
 void init_msc_write10_complete_cb(uint8_t lun);
-
 
