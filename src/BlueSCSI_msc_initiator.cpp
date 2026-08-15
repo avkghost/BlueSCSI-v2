@@ -33,6 +33,7 @@
 #include "BlueSCSI_settings.h"
 #include "BlueSCSI_platform_msc.h"
 #ifdef BLUESCSI_NETWORK
+#include "tusb_config.h"
 #include "network.h"
 extern bool scsiNetworkEnabled;
 extern struct scsiNetworkPacketQueue scsiNetworkInboundQueue;
@@ -243,63 +244,159 @@ static const char *bridge_network_command_name(uint8_t opcode)
     }
 }
 
+/* A USB MSC endpoint buffer is only CFG_TUD_MSC_EP_BUFSIZE bytes, yet the SCSI
+ * layer asks us to fill a much larger transfer (the host's READ CDB requests up
+ * to 16 KB; TinyUSB passes that as `bufsize`, not the real buffer size).  Frames
+ * larger than what fits in one MSC transfer are therefore split across multiple
+ * READ(6)s: each response carries one 6-byte header followed by up to
+ * (CFG_TUD_MSC_EP_BUFSIZE - 6) payload bytes, with record flag bit
+ * BRIDGE_NETWORK_CHUNK_FLAG set on every chunk except the last.  The host driver
+ * reassembles the chunks before handing the frame to the network stack.
+ *
+ * The length field always reports the payload actually returned in THIS response
+ * (the whole packet for a single-chunk packet, one chunk's bytes otherwise) and
+ * the payload always includes the trailing 4-byte Ethernet FCS -- matching what
+ * the DaynaPORT reference and the host parser expect. */
+#define BRIDGE_NETWORK_RX_HDR 6
+#define BRIDGE_NETWORK_CHUNK_FLAG 0x20
+
+/* CDB flag for WRITE(6) TX reassembly: the host splits a frame into multiple
+ * WRITE(6)s (each <= CFG_TUD_MSC_EP_BUFSIZE bytes) and marks every chunk except
+ * the last with this flag; the bridge buffers them and transmits once the chunk
+ * with the flag clear arrives. */
+#define BRIDGE_NETWORK_TX_CHUNK_FLAG 0x20
+
+static_assert(CFG_TUD_MSC_EP_BUFSIZE > BRIDGE_NETWORK_RX_HDR,
+              "CFG_TUD_MSC_EP_BUFSIZE must fit the 6-byte DaynaPORT record header");
+
+/* Read-side streaming state: one packet larger than the endpoint buffer is
+ * served across several READ(6)s.  A single global queue backs every bridge LUN
+ * (its readIndex/writeIndex are global), so one shared chunk state is
+ * consistent.  readIndex advances only when the final chunk is consumed; the
+ * state is reset on ENABLE so a wedged or reloaded host re-syncs. */
+struct
+{
+    bool active;      // a packet is being streamed out across READ(6)s
+    uint8_t idx;      // queue index being streamed
+    uint16_t offset;  // byte offset into packets[idx]
+    uint16_t total;   // sizes[idx]: full packet including the 4-byte FCS
+} static g_bridge_network_rx_chunk;
+
+/* Write-side reassembly buffer: chunks of one TX frame accumulate here until the
+ * final chunk arrives. */
+static uint8_t g_bridge_network_tx_buf[NETWORK_PACKET_MAX_SIZE];
+static uint16_t g_bridge_network_tx_len = 0;
+
 static int32_t bridge_network_read(uint8_t *buffer, uint16_t bufsize, uint32_t size, uint8_t cdb5)
 {
-    const size_t header_len = 6;
+    const size_t cap = bufsize < CFG_TUD_MSC_EP_BUFSIZE ? (size_t)bufsize : (size_t)CFG_TUD_MSC_EP_BUFSIZE;
 
-    if (bufsize < header_len)
+    if (cap < BRIDGE_NETWORK_RX_HDR)
     {
         return -1;
     }
 
-    if (scsiNetworkInboundQueue.readIndex == scsiNetworkInboundQueue.writeIndex)
-    {
-        memset(buffer, 0, header_len);
-        return header_len;
-    }
-
-    uint8_t idx = scsiNetworkInboundQueue.readIndex;
-    uint16_t packet_len = scsiNetworkInboundQueue.sizes[idx];
-    if (packet_len > 4)
-    {
-        packet_len -= 4;
-    }
-
-    uint32_t total_len = header_len + packet_len;
-    if (total_len > bufsize)
+    const size_t payload_cap = cap - BRIDGE_NETWORK_RX_HDR;
+    if (payload_cap == 0)
     {
         return -1;
     }
 
-    buffer[0] = (packet_len >> 8) & 0xff;
-    buffer[1] = packet_len & 0xff;
+    if (!g_bridge_network_rx_chunk.active)
+    {
+        if (scsiNetworkInboundQueue.readIndex == scsiNetworkInboundQueue.writeIndex)
+        {
+            memset(buffer, 0, BRIDGE_NETWORK_RX_HDR);
+            return BRIDGE_NETWORK_RX_HDR;
+        }
+
+        g_bridge_network_rx_chunk.active = true;
+        g_bridge_network_rx_chunk.idx = scsiNetworkInboundQueue.readIndex;
+        g_bridge_network_rx_chunk.offset = 0;
+        g_bridge_network_rx_chunk.total = scsiNetworkInboundQueue.sizes[g_bridge_network_rx_chunk.idx];
+    }
+
+    const uint16_t remaining = g_bridge_network_rx_chunk.total - g_bridge_network_rx_chunk.offset;
+    const size_t chunk_len = remaining > payload_cap ? payload_cap : (size_t)remaining;
+    const bool more = (size_t)g_bridge_network_rx_chunk.offset + chunk_len < g_bridge_network_rx_chunk.total;
+
+    buffer[0] = (uint8_t)(chunk_len >> 8);
+    buffer[1] = (uint8_t)(chunk_len & 0xff);
     buffer[2] = 0;
     buffer[3] = 0;
     buffer[4] = 0;
-    buffer[5] = 0;
+    buffer[5] = more ? BRIDGE_NETWORK_CHUNK_FLAG : 0;
 
-    memcpy(buffer + header_len, scsiNetworkInboundQueue.packets[idx], packet_len);
-    if (scsiNetworkInboundQueue.readIndex == NETWORK_PACKET_QUEUE_SIZE - 1)
+    memcpy(buffer + BRIDGE_NETWORK_RX_HDR,
+           scsiNetworkInboundQueue.packets[g_bridge_network_rx_chunk.idx] + g_bridge_network_rx_chunk.offset,
+           chunk_len);
+    g_bridge_network_rx_chunk.offset += (uint16_t)chunk_len;
+
+    if (!more)
     {
-        scsiNetworkInboundQueue.readIndex = 0;
-    }
-    else
-    {
-        scsiNetworkInboundQueue.readIndex++;
+        if (scsiNetworkInboundQueue.readIndex == NETWORK_PACKET_QUEUE_SIZE - 1)
+        {
+            scsiNetworkInboundQueue.readIndex = 0;
+        }
+        else
+        {
+            scsiNetworkInboundQueue.readIndex++;
+        }
+        g_bridge_network_rx_chunk.active = false;
     }
 
     (void)size;
     (void)cdb5;
-    return (int32_t)total_len;
+    return (int32_t)(BRIDGE_NETWORK_RX_HDR + chunk_len);
 }
 
 static int32_t bridge_network_write(const uint8_t *buffer, uint16_t bufsize, uint32_t size, uint8_t cdb5)
 {
+    if (size > bufsize)
+    {
+        size = bufsize;
+    }
+
+    if (cdb5 & BRIDGE_NETWORK_TX_CHUNK_FLAG)
+    {
+        // A WRITE(6) carrying the chunk flag continues a frame started by an
+        // earlier WRITE(6).  Reassemble and transmit once the final chunk (flag
+        // clear) arrives.
+        if (g_bridge_network_tx_len + size > sizeof(g_bridge_network_tx_buf))
+        {
+            g_bridge_network_tx_len = 0; // overlong chain: drop the partial frame
+        }
+        else
+        {
+            memcpy(g_bridge_network_tx_buf + g_bridge_network_tx_len, buffer, size);
+            g_bridge_network_tx_len += (uint16_t)size;
+        }
+        return (int32_t)size;
+    }
+
     if (cdb5 == 0x00)
     {
-        if (size > bufsize)
+        if (size == 0)
         {
-            size = bufsize;
+            // A zero-length WRITE(6) aborts any partial TX chain (the host driver
+            // bailed out mid-frame) and never transmits anything.
+            g_bridge_network_tx_len = 0;
+            return 0;
+        }
+        if (g_bridge_network_tx_len > 0)
+        {
+            // Final chunk of a reassembled frame.
+            if (g_bridge_network_tx_len + size > sizeof(g_bridge_network_tx_buf))
+            {
+                g_bridge_network_tx_len = 0;
+                return (int32_t)size;
+            }
+            memcpy(g_bridge_network_tx_buf + g_bridge_network_tx_len, buffer, size);
+            g_bridge_network_tx_len += (uint16_t)size;
+            int32_t ret = platform_network_send(g_bridge_network_tx_buf, g_bridge_network_tx_len) == 0
+                              ? (int32_t)size : -1;
+            g_bridge_network_tx_len = 0;
+            return ret;
         }
         return platform_network_send((uint8_t *)buffer, size) == 0 ? (int32_t)size : -1;
     }
@@ -462,10 +559,14 @@ static int32_t bridge_network_scsi_cb(uint8_t lun, const uint8_t scsi_cmd[16], v
             {
                 scsiNetworkEnabled = true;
                 memset(&scsiNetworkInboundQueue, 0, sizeof(scsiNetworkInboundQueue));
+                memset(&g_bridge_network_rx_chunk, 0, sizeof(g_bridge_network_rx_chunk));
+                g_bridge_network_tx_len = 0;
             }
             else
             {
                 scsiNetworkEnabled = false;
+                memset(&g_bridge_network_rx_chunk, 0, sizeof(g_bridge_network_rx_chunk));
+                g_bridge_network_tx_len = 0;
             }
             return 0;
 
