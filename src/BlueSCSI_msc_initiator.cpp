@@ -249,9 +249,11 @@ static const char *bridge_network_command_name(uint8_t opcode)
  * to 16 KB; TinyUSB passes that as `bufsize`, not the real buffer size).  Frames
  * larger than what fits in one MSC transfer are therefore split across multiple
  * READ(6)s: each response carries one 6-byte header followed by up to
- * (CFG_TUD_MSC_EP_BUFSIZE - 6) payload bytes, with record flag bit
- * BRIDGE_NETWORK_CHUNK_FLAG set on every chunk except the last.  The host driver
- * reassembles the chunks before handing the frame to the network stack.
+ * (CFG_TUD_MSC_EP_BUFSIZE - 6) payload bytes (4090 with the 4096-byte endpoint
+ * buffer, so a full 1518-byte Ethernet frame fits in one chunk), with record
+ * flag bit BRIDGE_NETWORK_CHUNK_FLAG set on every chunk except the last.  The
+ * host driver reassembles the chunks before handing the frame to the network
+ * stack.
  *
  * The length field always reports the payload actually returned in THIS response
  * (the whole packet for a single-chunk packet, one chunk's bytes otherwise) and
@@ -520,18 +522,18 @@ static int32_t bridge_network_scsi_cb(uint8_t lun, const uint8_t scsi_cmd[16], v
     const uint32_t size = ((uint32_t)scsi_cmd[3] << 8) | scsi_cmd[4];
     uint8_t *out = (uint8_t *)buffer;
 
-    logmsg("DaynaPORT bridge LUN ", (int)lun,
+    dbgmsg("DaynaPORT bridge LUN ", (int)lun,
            " handling opcode 0x", bytearray(&scsi_cmd[0], 1),
            " (", bridge_network_command_name(scsi_cmd[0]), ") size ", (int)size);
 
     switch (scsi_cmd[0])
     {
         case 0x08: // READ(6)
-            logmsg("DaynaPORT bridge READ(6): buffer ", (int)bufsize, " bytes, cdb5=0x", bytearray(&scsi_cmd[5], 1));
+            dbgmsg("DaynaPORT bridge READ(6): buffer ", (int)bufsize, " bytes, cdb5=0x", bytearray(&scsi_cmd[5], 1));
             return bridge_network_read(out, bufsize, size, scsi_cmd[5]);
 
         case 0x09: // MAC + counters
-            logmsg("DaynaPORT bridge MAC+STATS request");
+            dbgmsg("DaynaPORT bridge MAC+STATS request");
             if (bufsize < 18)
             {
                 return -1;
@@ -541,11 +543,11 @@ static int32_t bridge_network_scsi_cb(uint8_t lun, const uint8_t scsi_cmd[16], v
             return 18;
 
         case 0x0A: // WRITE(6)
-            logmsg("DaynaPORT bridge WRITE(6): buffer ", (int)bufsize, " bytes, cdb5=0x", bytearray(&scsi_cmd[5], 1));
+            dbgmsg("DaynaPORT bridge WRITE(6): buffer ", (int)bufsize, " bytes, cdb5=0x", bytearray(&scsi_cmd[5], 1));
             return bridge_network_write((const uint8_t *)buffer, bufsize, size, scsi_cmd[5]);
 
         case 0x0D:
-            logmsg("DaynaPORT bridge ADD MULTICAST");
+            dbgmsg("DaynaPORT bridge ADD MULTICAST");
             if (size > bufsize)
             {
                 return -1;
@@ -554,7 +556,7 @@ static int32_t bridge_network_scsi_cb(uint8_t lun, const uint8_t scsi_cmd[16], v
             return 0;
 
         case 0x0E:
-            logmsg("DaynaPORT bridge TOGGLE INTERFACE: ", (scsi_cmd[5] & 0x80) ? "enable" : "disable");
+            dbgmsg("DaynaPORT bridge TOGGLE INTERFACE: ", (scsi_cmd[5] & 0x80) ? "enable" : "disable");
             if (scsi_cmd[5] & 0x80)
             {
                 scsiNetworkEnabled = true;
@@ -571,15 +573,15 @@ static int32_t bridge_network_scsi_cb(uint8_t lun, const uint8_t scsi_cmd[16], v
             return 0;
 
         case 0x1A:
-            logmsg("DaynaPORT bridge MODE SENSE (ignored)");
+            dbgmsg("DaynaPORT bridge MODE SENSE (ignored)");
         case 0x40:
-            if (scsi_cmd[0] == 0x40) logmsg("DaynaPORT bridge SET MAC (ignored)");
+            if (scsi_cmd[0] == 0x40) dbgmsg("DaynaPORT bridge SET MAC (ignored)");
         case 0x80:
-            if (scsi_cmd[0] == 0x80) logmsg("DaynaPORT bridge SET MODE (ignored)");
+            if (scsi_cmd[0] == 0x80) dbgmsg("DaynaPORT bridge SET MODE (ignored)");
             return 0;
 
         case SCSI_NETWORK_WIFI_CMD:
-            logmsg("DaynaPORT bridge WIFI CMD subcommand 0x", bytearray(&scsi_cmd[1], 1));
+            dbgmsg("DaynaPORT bridge WIFI CMD subcommand 0x", bytearray(&scsi_cmd[1], 1));
             return bridge_network_wifi_command(lun, scsi_cmd, buffer, bufsize);
 
         default:

@@ -356,11 +356,14 @@ uint32_t scsiHostWrite(const uint8_t *data, uint32_t count)
 
     for (uint32_t i = 0; i < count; i++)
     {
+        uint32_t start = platform_millis();
         while (!SCSI_IN(REQ))
         {
-            if (g_scsiHostPhyReset || SCSI_IN(IO) || SCSI_IN(CD) != cd_start || SCSI_IN(MSG) != msg_start)
+            platform_reset_watchdog();
+            if (g_scsiHostPhyReset || SCSI_IN(IO) || SCSI_IN(CD) != cd_start || SCSI_IN(MSG) != msg_start
+                || (platform_millis() - start) >= 10000)
             {
-                // Target switched out of DATA_OUT mode
+                // Target switched out of DATA_OUT mode or stopped asserting REQ
                 logmsg("scsiHostWrite: sent ", (int)i, " bytes, expected ", (int)count);
                 return i;
             }
@@ -480,6 +483,7 @@ void scsiHostWaitBusFree()
     while (SCSI_IN(BSY))
     {
         platform_poll();
+        platform_reset_watchdog();
 
         if (SCSI_IN(REQ))
         {

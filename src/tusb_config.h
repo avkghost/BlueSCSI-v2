@@ -54,8 +54,10 @@ extern "C" {
 #define CFG_TUD_CDC_TX_BUFSIZE 256
 #define CFG_TUD_CDC_EP_BUFSIZE 64
 
-// MSC buffer size
-#define CFG_TUD_MSC_EP_BUFSIZE 512
+// MSC buffer size: 4096 lets each USB READ10/WRITE10 chunk move 8 sectors
+// instead of 1, cutting per-chunk MSC overhead ~8x (full-speed USB still
+// caps bulk throughput near ~1 MB/s).
+#define CFG_TUD_MSC_EP_BUFSIZE 4096
 
 #ifdef __cplusplus
 }
