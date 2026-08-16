@@ -351,6 +351,12 @@ uint32_t scsiHostWrite(const uint8_t *data, uint32_t count)
 {
     scsiLogDataOut(data, count);
 
+    if (g_scsiHostBusWidth == 0 || (count & 1) == 0)
+    {
+        // 8-bit bus supports any byte count, 16-bit bus requires even byte count
+        return scsi_accel_host_write(data, count, g_scsiHostBusWidth, &g_scsiHostPhyReset);
+    }
+
     int cd_start = SCSI_IN(CD);
     int msg_start = SCSI_IN(MSG);
 

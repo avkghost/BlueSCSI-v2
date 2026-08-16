@@ -1,5 +1,19 @@
-# DaynaPORT Enable Trace
+# PIO-accelerated SCSI initiator write
 
+- [x] Add `scsi_host_async_write` + `scsi_host_async_write_wide` to `scsi_accel_host_RP2MCU.pio`
+- [x] Regenerate `.pio.h` via `build-ultra-clean/pioasm/pioasm`
+- [x] Declare `scsi_accel_host_write` in `scsi_accel_host.h`
+- [x] Add `SCSIHOST_WRITE` state, `config_gpio()` WRITE branch (PIO0 mux, pindirs, DATA_DIR high)
+- [x] Implement `scsi_accel_host_write()` (TX FIFO push loop, RX completion marker wait, abort handling)
+- [x] Wire init: load write program (#ifdef wide), patch REQ waits at +3/+14, build write pio_cfg
+- [x] Route `scsiHostWrite()` to accel (narrow any count, wide even count)
+- [x] Build both main + bootloader cleanly (pio0 = read 7 + write 18 = 25 ≤ 32)
+
+- [x] Hardware test on Jaz: write 313 kB/s (bit-bang) → 442 kB/s (PIO accel, +41%), read unchanged 668 kB/s
+- [x] Commit after test passes (branch `avkghost/birdge-with-daynaport`)
+- [ ] Wide path is compile-only (no wide board available)
+
+# DaynaPORT Enable Trace
 - [x] Make the Dayna quiet window adaptive when USB bus reset storms repeat.
 - [x] Extend the firmware-side Dayna quiet window after USB bus reset and unplug events.
 - [x] Narrow the Linux 7.x diagnostic fork to log only the relevant DaynaPORT opcodes.

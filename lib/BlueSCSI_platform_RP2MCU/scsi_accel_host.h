@@ -30,3 +30,7 @@ void scsi_accel_host_init();
 // Read data from SCSI bus.
 // Number of bytes to read must be divisible by two.
 uint32_t scsi_accel_host_read(uint8_t *buf, uint32_t count, int *parityError, int busWidth, volatile int *resetFlag);
+
+// Write data to SCSI bus.
+// On 8-bit bus any byte count is supported, on 16-bit bus count must be divisible by two.
+uint32_t scsi_accel_host_write(const uint8_t *data, uint32_t count, int busWidth, volatile int *resetFlag);

@@ -61,3 +61,65 @@ start:
     in null, 14                 side 0  ; Padding bits
     wait 1 gpio REQ             side 0  ; Wait for REQ high
     jmp x-- start               side 1  ; Deassert ACK, decrement byte count and jump to start
+
+
+; Write to SCSI bus using asynchronous handshake.
+; Data is taken as 32-bit words from the TX fifo, with the GPIO value of
+; the 8 data bits + 1 parity bit in the low 9 bits.
+; Number of bytes to send minus 1 should be written to TX fifo.
+; A completion marker word is pushed to the RX fifo after the last byte.
+.program scsi_host_async_write
+    .side_set 1
+
+    pull block                  side 1  ; Get number of bytes to send
+    mov x, osr                  side 1  ; Store to counter X
+
+start:
+    pull block                  side 1  ; Get data word
+    wait 0 gpio REQ             side 1  ; Wait for REQ low
+    out pins, 9                 side 1  ; Drive data + parity on bus
+    nop                         side 1  ; DB setup time before ACK
+    nop                         side 1
+    nop                         side 1
+    nop                         side 1
+    nop                         side 1
+    nop                         side 1
+    nop                         side 1
+    nop                         side 1
+    nop                         side 0  ; Assert ACK
+    wait 1 gpio REQ             side 0  ; Wait for REQ high
+    jmp x-- start               side 1  ; Deassert ACK, decrement byte count and jump to start
+
+    in null, 32                 side 1  ; Zero ISR for completion marker
+    push block                  side 1  ; Push completion marker to RX fifo
+
+
+; Write to SCSI bus using asynchronous handshake in wide bus mode.
+; Data is taken as 32-bit words from the TX fifo, with the GPIO value of
+; the 16 data bits + 2 parity bits in the low 18 bits.
+; Number of words to send minus 1 should be written to TX fifo.
+; A completion marker word is pushed to the RX fifo after the last word.
+.program scsi_host_async_write_wide
+    .side_set 1
+
+    pull block                  side 1  ; Get number of words to send
+    mov x, osr                  side 1  ; Store to counter X
+
+start:
+    pull block                  side 1  ; Get data word
+    wait 0 gpio REQ             side 1  ; Wait for REQ low
+    out pins, 18                side 1  ; Drive data + parity on bus
+    nop                         side 1  ; DB setup time before ACK
+    nop                         side 1
+    nop                         side 1
+    nop                         side 1
+    nop                         side 1
+    nop                         side 1
+    nop                         side 1
+    nop                         side 1
+    nop                         side 0  ; Assert ACK
+    wait 1 gpio REQ             side 0  ; Wait for REQ high
+    jmp x-- start               side 1  ; Deassert ACK, decrement word count and jump to start
+
+    in null, 32                 side 1  ; Zero ISR for completion marker
+    push block                  side 1  ; Push completion marker to RX fifo
