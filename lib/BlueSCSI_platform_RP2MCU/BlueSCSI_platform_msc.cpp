@@ -255,6 +255,21 @@ extern "C" int32_t tud_msc_request_sense_cb(uint8_t lun, void* buffer, uint16_t 
     return raw_len;
   }
 
+  // Target did not respond to REQUEST SENSE — construct a NOT READY
+  // (sense key 0x02, asc 0x04, ascq 0x04) response so the host stops
+  // retrying instead of spinning on all-zeros sense.
+  if (bufsize >= 18)
+  {
+    uint8_t *p = (uint8_t *)buffer;
+    memset(p, 0, 18);
+    p[0] = 0x70;          // Response code: current errors, fixed format
+    p[2] = 0x02;          // Sense key: NOT READY
+    p[7] = 0x0E;          // Additional sense length
+    p[12] = 0x04;         // ASC: LOGICAL UNIT NOT READY
+    p[13] = 0x04;         // ASCQ: INITIALIZATION COMMAND REQUIRED
+    return 18;
+  }
+
   return 18;
 }
 
@@ -447,8 +462,13 @@ extern "C" void tud_msc_capacity_cb(uint8_t lun, uint32_t *block_count,
 extern "C" int32_t tud_msc_scsi_cb(uint8_t lun, const uint8_t scsi_cmd[16], void *buffer,
                         uint16_t bufsize)
 {
-  MSCScopedLock lock;
+  // Initiator path: handle BEFORE MSCScopedLock so the blocking SCSI
+  // operation does not hold g_msc_lock / __usb_mutex.  The SCSI loop
+  // calls platform_poll() → tud_task(); without this the mutex would
+  // prevent tud_task() from running and USB enumeration would stall.
   if (g_msc_initiator) return init_msc_scsi_cb(lun, scsi_cmd, buffer, bufsize);
+
+  MSCScopedLock lock;
 
   const void *response = NULL;
   uint16_t resplen = 0;

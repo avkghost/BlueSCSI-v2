@@ -830,10 +830,21 @@ int scsiInitiatorRunCommand(int target_id,
     uint32_t start = platform_millis();
     while ((phase = (SCSI_PHASE)scsiHostPhyGetPhase()) != BUS_FREE)
     {
-        // If explicit timeout is specified, prevent watchdog from triggering too early.
-        if ((uint32_t)(platform_millis() - start) < timeout)
+        // Always keep the watchdog fed while waiting on the target.
+        platform_reset_watchdog();
+
+        if (timeout != 0 && (uint32_t)(platform_millis() - start) > timeout)
         {
-            platform_reset_watchdog();
+            dbgmsg("------ Timeout waiting for phase");
+            status = -1;
+            break;
+        }
+
+        if (timeout == 0 && (uint32_t)(platform_millis() - start) > 15000)
+        {
+            dbgmsg("------ Target unresponsive after 15s, aborting command");
+            status = -1;
+            break;
         }
 
         platform_poll();
@@ -1198,10 +1209,20 @@ int scsiInitiatorMessage(int target_id,
     uint32_t start = platform_millis();
     while ((phase = (SCSI_PHASE)scsiHostPhyGetPhase()) != BUS_FREE)
     {
-        // If explicit timeout is specified, prevent watchdog from triggering too early.
-        if ((uint32_t)(platform_millis() - start) < timeout)
+        platform_reset_watchdog();
+
+        if (timeout != 0 && (uint32_t)(platform_millis() - start) > timeout)
         {
-            platform_reset_watchdog();
+            dbgmsg("------ Timeout waiting for phase");
+            status = -1;
+            break;
+        }
+
+        if (timeout == 0 && (uint32_t)(platform_millis() - start) > 15000)
+        {
+            dbgmsg("------ Target unresponsive after 15s, aborting command");
+            status = -1;
+            break;
         }
 
         platform_poll();

@@ -41,7 +41,15 @@ extern struct scsiNetworkPacketQueue scsiNetworkInboundQueue;
 #include <scsi.h>
 #include <BlueSCSI_platform.h>
 #include <minIni.h>
+
+// Forward declarations for TinyUSB functions used in dead target recovery.
+// Avoids including <tusb.h> which pulls in the full TinyUSB stack and can
+// conflict with other includes in this translation unit.
+extern "C" void tud_disconnect(void);
+extern "C" void tud_connect(void);
 #include "SdFat.h"
+#include <pico/mutex.h>
+extern mutex_t __usb_mutex;
 
 bool g_msc_initiator;
 
@@ -78,12 +86,23 @@ static struct {
     uint8_t device_type; // Peripheral device type from INQUIRY byte 0
     bool is_removable;   // RMB bit from INQUIRY byte 1
     bool bridge_network; // Synthetic DaynaPORT/AmigaWIFI target from config
+    uint8_t consecutive_failures; // Consecutive SCSI command failures (offline detection)
 } g_msc_initiator_targets[NUM_SCSIID];
 static int g_msc_initiator_target_count;
 
 // Sectors to read ahead of the host. The USB endpoint buffer is only one sector,
 // so without read-ahead every host read costs a full SCSI command round trip.
-#define MSC_PREFETCH_SECTORS 32
+// 64 sectors = 32KB for 512-byte drives, covers 8 USB 4KB transfers.
+#define MSC_PREFETCH_SECTORS 64
+
+// After this many consecutive SCSI command failures, consider the target
+// dead and attempt recovery (bus reset + rescan, then USB re-enumeration).
+#define MSC_TARGET_OFFLINE_THRESHOLD 5
+
+// Recovery timing: try bus reset every 15s, give up after 3 attempts
+// and force USB re-enumeration (~45s total).
+#define MSC_RECOVERY_INTERVAL_MS    15000
+#define MSC_RECOVERY_MAX_ATTEMPTS   3
 
 // Extra reads to serve without prefetching after a prefetch fails, on top of the
 // failed window itself. The bad sector can be anywhere in the window, so the host
@@ -120,6 +139,16 @@ static struct {
 
     // Scan new targets if none found
     uint32_t last_scan_time;
+
+    // Dead target recovery
+    uint32_t last_recovery_time;
+    uint8_t recovery_attempts;
+
+    // Adaptive prefetch: track access pattern to grow/shrink depth
+    uint32_t prefetch_adaptive_depth;  // Current adaptive depth (starts at prefetch_depth)
+    uint32_t prefetch_last_access_lba; // LBA of previous host read
+    uint8_t prefetch_sequential_count; // Consecutive sequential accesses
+    uint8_t prefetch_random_count;     // Consecutive random accesses
 } g_msc_initiator_state;
 
 static int get_target(uint8_t lun);
@@ -304,52 +333,124 @@ static int32_t bridge_network_read(uint8_t *buffer, uint16_t bufsize, uint32_t s
         return -1;
     }
 
-    if (!g_bridge_network_rx_chunk.active)
+    // If we were in the middle of streaming a large frame across multiple
+    // READ(6)s, continue delivering its remaining chunks.
+    if (g_bridge_network_rx_chunk.active)
     {
-        if (scsiNetworkInboundQueue.readIndex == scsiNetworkInboundQueue.writeIndex)
+        const uint16_t remaining = g_bridge_network_rx_chunk.total - g_bridge_network_rx_chunk.offset;
+        const size_t chunk_len = remaining > payload_cap ? payload_cap : (size_t)remaining;
+        const bool more = (size_t)g_bridge_network_rx_chunk.offset + chunk_len < g_bridge_network_rx_chunk.total;
+
+        buffer[0] = (uint8_t)(chunk_len >> 8);
+        buffer[1] = (uint8_t)(chunk_len & 0xff);
+        buffer[2] = 0;
+        buffer[3] = 0;
+        buffer[4] = 0;
+        buffer[5] = more ? BRIDGE_NETWORK_CHUNK_FLAG : 0;
+
+        memcpy(buffer + BRIDGE_NETWORK_RX_HDR,
+               scsiNetworkInboundQueue.packets[g_bridge_network_rx_chunk.idx] + g_bridge_network_rx_chunk.offset,
+               chunk_len);
+        g_bridge_network_rx_chunk.offset += (uint16_t)chunk_len;
+
+        if (!more)
         {
-            memset(buffer, 0, BRIDGE_NETWORK_RX_HDR);
-            return BRIDGE_NETWORK_RX_HDR;
+            scsiNetworkInboundQueue.readIndex =
+                (g_bridge_network_rx_chunk.idx == NETWORK_PACKET_QUEUE_SIZE - 1) ? 0 : g_bridge_network_rx_chunk.idx + 1;
+            g_bridge_network_rx_chunk.active = false;
         }
 
-        g_bridge_network_rx_chunk.active = true;
-        g_bridge_network_rx_chunk.idx = scsiNetworkInboundQueue.readIndex;
-        g_bridge_network_rx_chunk.offset = 0;
-        g_bridge_network_rx_chunk.total = scsiNetworkInboundQueue.sizes[g_bridge_network_rx_chunk.idx];
+        (void)size;
+        (void)cdb5;
+        return (int32_t)(BRIDGE_NETWORK_RX_HDR + chunk_len);
     }
 
-    const uint16_t remaining = g_bridge_network_rx_chunk.total - g_bridge_network_rx_chunk.offset;
-    const size_t chunk_len = remaining > payload_cap ? payload_cap : (size_t)remaining;
-    const bool more = (size_t)g_bridge_network_rx_chunk.offset + chunk_len < g_bridge_network_rx_chunk.total;
-
-    buffer[0] = (uint8_t)(chunk_len >> 8);
-    buffer[1] = (uint8_t)(chunk_len & 0xff);
-    buffer[2] = 0;
-    buffer[3] = 0;
-    buffer[4] = 0;
-    buffer[5] = more ? BRIDGE_NETWORK_CHUNK_FLAG : 0;
-
-    memcpy(buffer + BRIDGE_NETWORK_RX_HDR,
-           scsiNetworkInboundQueue.packets[g_bridge_network_rx_chunk.idx] + g_bridge_network_rx_chunk.offset,
-           chunk_len);
-    g_bridge_network_rx_chunk.offset += (uint16_t)chunk_len;
-
-    if (!more)
+    // Queue empty — return empty header
+    if (scsiNetworkInboundQueue.readIndex == scsiNetworkInboundQueue.writeIndex)
     {
-        if (scsiNetworkInboundQueue.readIndex == NETWORK_PACKET_QUEUE_SIZE - 1)
+        memset(buffer, 0, BRIDGE_NETWORK_RX_HDR);
+        return BRIDGE_NETWORK_RX_HDR;
+    }
+
+    // Check if the first frame fits entirely in the buffer
+    uint8_t first_idx = scsiNetworkInboundQueue.readIndex;
+    uint16_t first_len = scsiNetworkInboundQueue.sizes[first_idx];
+
+    if (first_len > payload_cap)
+    {
+        // Frame too large for buffer — stream it across multiple READ(6)s
+        g_bridge_network_rx_chunk.active = true;
+        g_bridge_network_rx_chunk.idx = first_idx;
+        g_bridge_network_rx_chunk.offset = 0;
+        g_bridge_network_rx_chunk.total = first_len;
+
+        const size_t chunk_len = first_len > payload_cap ? payload_cap : (size_t)first_len;
+        const bool more = chunk_len < first_len;
+
+        buffer[0] = (uint8_t)(chunk_len >> 8);
+        buffer[1] = (uint8_t)(chunk_len & 0xff);
+        buffer[2] = 0;
+        buffer[3] = 0;
+        buffer[4] = 0;
+        buffer[5] = more ? BRIDGE_NETWORK_CHUNK_FLAG : 0;
+
+        memcpy(buffer + BRIDGE_NETWORK_RX_HDR,
+               scsiNetworkInboundQueue.packets[first_idx], chunk_len);
+        g_bridge_network_rx_chunk.offset = (uint16_t)chunk_len;
+
+        if (!more)
         {
-            scsiNetworkInboundQueue.readIndex = 0;
+            scsiNetworkInboundQueue.readIndex =
+                (first_idx == NETWORK_PACKET_QUEUE_SIZE - 1) ? 0 : first_idx + 1;
+            g_bridge_network_rx_chunk.active = false;
         }
-        else
-        {
-            scsiNetworkInboundQueue.readIndex++;
-        }
-        g_bridge_network_rx_chunk.active = false;
+
+        (void)size;
+        (void)cdb5;
+        return (int32_t)(BRIDGE_NETWORK_RX_HDR + chunk_len);
+    }
+
+    // Multi-frame batching: pack as many complete frames as fit in the buffer.
+    // Each frame is [6-byte header] + [payload]. All headers get CHUNK_FLAG
+    // set; we clear the last one after the loop so the parser knows to stop.
+    size_t offset = 0;
+
+    while (offset + BRIDGE_NETWORK_RX_HDR < cap)
+    {
+        uint8_t pkt_idx = scsiNetworkInboundQueue.readIndex;
+        if (pkt_idx == scsiNetworkInboundQueue.writeIndex)
+            break;
+
+        uint16_t pkt_len = scsiNetworkInboundQueue.sizes[pkt_idx];
+        size_t room = cap - offset - BRIDGE_NETWORK_RX_HDR;
+
+        if (pkt_len > room)
+            break;
+
+        buffer[offset + 0] = (uint8_t)(pkt_len >> 8);
+        buffer[offset + 1] = (uint8_t)(pkt_len & 0xff);
+        buffer[offset + 2] = 0;
+        buffer[offset + 3] = 0;
+        buffer[offset + 4] = 0;
+        buffer[offset + 5] = BRIDGE_NETWORK_CHUNK_FLAG;
+
+        memcpy(buffer + offset + BRIDGE_NETWORK_RX_HDR,
+               scsiNetworkInboundQueue.packets[pkt_idx], pkt_len);
+        offset += BRIDGE_NETWORK_RX_HDR + pkt_len;
+
+        scsiNetworkInboundQueue.readIndex =
+            (pkt_idx == NETWORK_PACKET_QUEUE_SIZE - 1) ? 0 : pkt_idx + 1;
+    }
+
+    // Clear CHUNK_FLAG on the last header so the host knows transfer ends here
+    if (offset >= BRIDGE_NETWORK_RX_HDR)
+    {
+        buffer[offset - BRIDGE_NETWORK_RX_HDR + 5] = 0;
     }
 
     (void)size;
     (void)cdb5;
-    return (int32_t)(BRIDGE_NETWORK_RX_HDR + chunk_len);
+    return (int32_t)offset;
 }
 
 static int32_t bridge_network_write(const uint8_t *buffer, uint16_t bufsize, uint32_t size, uint8_t cdb5)
@@ -703,6 +804,7 @@ static void scan_targets()
         g_msc_initiator_targets[found_count].writable = false;
         g_msc_initiator_targets[found_count].media_ready = false;
         g_msc_initiator_targets[found_count].bridge_network = false;
+        g_msc_initiator_targets[found_count].consecutive_failures = 0;
         const char *type_name = msc_device_type_name(device_type);
 
         bool ready = scsiTestUnitReady(target_id);
@@ -797,6 +899,12 @@ static void scan_targets()
 
     // USB MSC requests can start processing after we set this
     g_msc_initiator_target_count = found_count;
+
+    // Reset adaptive prefetch state on target rescan (media swap, etc.)
+    g_msc_initiator_state.prefetch_adaptive_depth = g_msc_initiator_state.prefetch_depth;
+    g_msc_initiator_state.prefetch_last_access_lba = 0;
+    g_msc_initiator_state.prefetch_sequential_count = 0;
+    g_msc_initiator_state.prefetch_random_count = 0;
 }
 
 bool setup_msc_initiator()
@@ -817,12 +925,19 @@ bool setup_msc_initiator()
     {
         g_msc_initiator_state.prefetch_depth = ini_getl("SCSI", "InitiatorMSCPrefetchSectors",
                                                         MSC_PREFETCH_SECTORS, CONFIGFILE);
-        logmsg("--- Initiator prefetch: ", (int)g_msc_initiator_state.prefetch_depth, " sectors read-ahead");
+        g_msc_initiator_state.prefetch_adaptive_depth = g_msc_initiator_state.prefetch_depth;
+        logmsg("--- Initiator prefetch: ", (int)g_msc_initiator_state.prefetch_depth,
+               " sectors read-ahead (adaptive)");
     }
     else
     {
         g_msc_initiator_state.prefetch_depth = 0;
+        g_msc_initiator_state.prefetch_adaptive_depth = 0;
     }
+
+    g_msc_initiator_state.prefetch_last_access_lba = 0;
+    g_msc_initiator_state.prefetch_sequential_count = 0;
+    g_msc_initiator_state.prefetch_random_count = 0;
 
     g_msc_initiator_state.status_interval = ini_getl("SCSI", "InitiatorMSCStatusInterval", 5000, CONFIGFILE);
     g_msc_initiator_state.readonly = ini_getbool("SCSI", "InitiatorMSCReadOnly", false, CONFIGFILE);
@@ -852,6 +967,61 @@ void poll_msc_initiator()
         platform_reset_watchdog();
         scan_targets();
         g_msc_initiator_state.last_scan_time = time_now;
+    }
+
+    // Dead target recovery: check if any target has exceeded the failure threshold.
+    if (g_msc_initiator_target_count > 0)
+    {
+        bool has_dead_target = false;
+        for (int i = 0; i < g_msc_initiator_target_count; i++)
+        {
+            if (g_msc_initiator_targets[i].bridge_network)
+                continue;
+            if (g_msc_initiator_targets[i].consecutive_failures >= MSC_TARGET_OFFLINE_THRESHOLD)
+            {
+                has_dead_target = true;
+                break;
+            }
+        }
+
+        if (has_dead_target)
+        {
+            uint32_t time_since_recovery = time_now - g_msc_initiator_state.last_recovery_time;
+
+            if (time_since_recovery > MSC_RECOVERY_INTERVAL_MS)
+            {
+                if (g_msc_initiator_state.recovery_attempts < MSC_RECOVERY_MAX_ATTEMPTS)
+                {
+                    // Phase 1: Bus reset + rescan to try to recover the target.
+                    g_msc_initiator_state.recovery_attempts++;
+                    logmsg("SCSI: dead target recovery attempt ",
+                           (int)g_msc_initiator_state.recovery_attempts, "/",
+                           MSC_RECOVERY_MAX_ATTEMPTS);
+
+                    scsiHostPhyReset();
+                    platform_delay_ms(500);
+                    scan_targets();
+                    g_msc_initiator_state.last_scan_time = time_now;
+                }
+                else
+                {
+                    // Phase 2: USB re-enumeration — force host to rediscover
+                    // the device without the dead target.
+                    logmsg("SCSI: recovery failed, forcing USB re-enumeration");
+                    tud_disconnect();
+                    platform_delay_ms_with_usb(250);
+                    tud_connect();
+                    g_msc_initiator_state.recovery_attempts = 0;
+                }
+
+                g_msc_initiator_state.last_recovery_time = time_now;
+            }
+        }
+        else
+        {
+            // No dead targets — reset recovery state.
+            g_msc_initiator_state.recovery_attempts = 0;
+        }
     }
 
     uint32_t delta = time_now - g_msc_initiator_state.status_prev_time;
@@ -1137,16 +1307,36 @@ bool init_msc_test_unit_ready_cb(uint8_t lun)
         {
             g_msc_initiator_targets[lun].media_ready = false;
             g_msc_initiator_targets[lun].writable = false;
+            g_msc_initiator_targets[lun].consecutive_failures++;
         }
         else
         {
             g_msc_initiator_targets[lun].media_ready = true;
             g_msc_initiator_targets[lun].writable = true;
+            g_msc_initiator_targets[lun].consecutive_failures = 0;
         }
+    }
+    else
+    {
+        if (!ready)
+            g_msc_initiator_targets[lun].consecutive_failures++;
+        else
+            g_msc_initiator_targets[lun].consecutive_failures = 0;
     }
     if (!ready)
     {
         publish_last_sense_to_host(lun, get_target(lun), "TEST UNIT READY");
+
+        // Dead target recovery: after 5 consecutive failures, attempt a bus
+        // reset so a wedged target does not stay stuck forever.
+        if (g_msc_initiator_targets[lun].consecutive_failures >= 5)
+        {
+            logmsg("Target ", get_target(lun), " failed ",
+                   (int)g_msc_initiator_targets[lun].consecutive_failures,
+                   " consecutive tests, attempting bus reset");
+            scsiHostPhyReset();
+            g_msc_initiator_targets[lun].consecutive_failures = 0;
+        }
     }
     return ready;
 }
@@ -1201,53 +1391,88 @@ void init_msc_capacity_cb(uint8_t lun, uint32_t *block_count, uint16_t *block_si
 
 int32_t init_msc_scsi_cb(uint8_t lun, const uint8_t scsi_cmd[16], void *buffer, uint16_t bufsize)
 {
-    if (!ensure_targets_scanned())
+    // Re-entrancy guard: tud_task() can call tud_msc_scsi_cb() again while
+    // we are blocked in scsiInitiatorRunCommand, so reject nested calls.
+    static bool scsi_op_in_progress = false;
+    if (scsi_op_in_progress)
     {
         return -1;
+    }
+    scsi_op_in_progress = true;
+
+    int32_t result = -1;
+
+    if (!ensure_targets_scanned())
+    {
+        goto done;
     }
 
     if (g_msc_initiator_target_count == 0)
     {
-        return -1;
+        goto done;
     }
 
     if (bridge_network_is_lun(lun))
     {
 #ifdef BLUESCSI_NETWORK
-        return bridge_network_scsi_cb(lun, scsi_cmd, buffer, bufsize);
-#else
-        return -1;
+        result = bridge_network_scsi_cb(lun, scsi_cmd, buffer, bufsize);
 #endif
+        goto done;
     }
 
     dbgmsg("-- MSC Raw SCSI command ", bytearray(scsi_cmd, 16));
     LED_ON();
     g_msc_initiator_state.status_reqcount++;
 
-    // NOTE: the TinyUSB API around free-form commands is not very good,
-    // this function could need improvement.
-    
-    // Figure out command length
-    static const uint8_t CmdGroupBytes[8] = {6, 10, 10, 6, 16, 12, 6, 6}; // From SCSI2SD
-    int cmdlen = CmdGroupBytes[scsi_cmd[0] >> 5];
+    {
+        // Figure out command length
+        static const uint8_t CmdGroupBytes[8] = {6, 10, 10, 6, 16, 12, 6, 6}; // From SCSI2SD
+        int cmdlen = CmdGroupBytes[scsi_cmd[0] >> 5];
 
-    int target = get_target(lun);
-    int status = scsiInitiatorRunCommand(target,
+        int target = get_target(lun);
+        int status;
+
+        // Release the USB mutex so tud_task() can run during the blocking SCSI
+        // call. tud_msc_scsi_cb is invoked from tud_task() which was entered
+        // while __usb_mutex was held by platform_poll(). Without releasing it
+        // here, every platform_poll() inside the SCSI loop finds the mutex
+        // already held and skips tud_task(), starving USB enumeration.
+        mutex_exit(&__usb_mutex);
+
+        // Pass buffer as both bufIn and bufOut.  The SCSI bus phase
+        // (DATA_IN vs DATA_OUT) is determined by the target, not by us.
+        status = scsiInitiatorRunCommand(target,
                                          scsi_cmd, cmdlen,
-                                         NULL, 0,
+                                         (uint8_t*)buffer, bufsize,
                                          (const uint8_t*)buffer, bufsize);
 
-    if (status != 0)
-    {
-        scsiClearLastRequestSense();
-        uint8_t sense_key;
-        scsiRequestSense(target, &sense_key);
-                publish_last_sense_to_host(lun, target, "READ CAPACITY");
+        // Re-acquire the mutex to restore the caller's state.
+        mutex_try_enter(&__usb_mutex, NULL);
+
+        if (status != 0)
+        {
+            g_msc_initiator_targets[lun].consecutive_failures++;
+
+            scsiClearLastRequestSense();
+            uint8_t sense_key = 0;
+            scsiRequestSense(target, &sense_key);
+
+            char cmd_name[16];
+            snprintf(cmd_name, sizeof(cmd_name), "opcode 0x%02X", scsi_cmd[0]);
+            publish_last_sense_to_host(lun, target, cmd_name);
+        }
+        else
+        {
+            g_msc_initiator_targets[lun].consecutive_failures = 0;
+        }
+
+        LED_OFF();
+        result = status;
     }
 
-    LED_OFF();
-
-    return status;
+done:
+    scsi_op_in_progress = false;
+    return result;
 }
 
 static int do_read6_or_10(int target_id, uint32_t start_sector, uint32_t sectorcount, uint32_t sectorsize, void *buffer, bool use_read10)
@@ -1319,7 +1544,7 @@ static int32_t init_msc_read_partial(uint8_t lun, uint32_t lba, uint32_t offset,
     if (!covered)
     {
         LED_ON();
-        uint32_t depth = g_msc_initiator_state.prefetch_depth;
+        uint32_t depth = g_msc_initiator_state.prefetch_adaptive_depth;
         uint32_t max_by_buffer = g_msc_initiator_state.prefetch_bufsize / sectorsize;
         uint32_t max_by_disk = disk_sectorcount - lba;
         if (depth < 1) depth = 1;
@@ -1483,7 +1708,41 @@ int32_t init_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void* buf
     }
     else if (!covered && lba < disk_sectorcount)
     {
-        uint32_t depth = g_msc_initiator_state.prefetch_depth;
+        // Adaptive prefetch: detect sequential access and grow depth
+        uint32_t prev_lba = g_msc_initiator_state.prefetch_last_access_lba;
+        bool is_sequential = (prev_lba > 0 && lba >= prev_lba && lba <= prev_lba + sectorsize);
+
+        if (is_sequential)
+        {
+            g_msc_initiator_state.prefetch_sequential_count++;
+            g_msc_initiator_state.prefetch_random_count = 0;
+            if (g_msc_initiator_state.prefetch_sequential_count >= 3 &&
+                g_msc_initiator_state.prefetch_adaptive_depth < g_msc_initiator_state.prefetch_depth * 2)
+            {
+                g_msc_initiator_state.prefetch_adaptive_depth =
+                    g_msc_initiator_state.prefetch_adaptive_depth * 2;
+                if (g_msc_initiator_state.prefetch_adaptive_depth > g_msc_initiator_state.prefetch_depth * 2)
+                    g_msc_initiator_state.prefetch_adaptive_depth = g_msc_initiator_state.prefetch_depth * 2;
+                dbgmsg("Prefetch adaptive: depth increased to ", (int)g_msc_initiator_state.prefetch_adaptive_depth);
+            }
+        }
+        else
+        {
+            g_msc_initiator_state.prefetch_random_count++;
+            g_msc_initiator_state.prefetch_sequential_count = 0;
+            if (g_msc_initiator_state.prefetch_random_count >= 3 &&
+                g_msc_initiator_state.prefetch_adaptive_depth > 4)
+            {
+                g_msc_initiator_state.prefetch_adaptive_depth =
+                    g_msc_initiator_state.prefetch_adaptive_depth / 2;
+                if (g_msc_initiator_state.prefetch_adaptive_depth < 4)
+                    g_msc_initiator_state.prefetch_adaptive_depth = 4;
+                dbgmsg("Prefetch adaptive: depth decreased to ", (int)g_msc_initiator_state.prefetch_adaptive_depth);
+            }
+        }
+        g_msc_initiator_state.prefetch_last_access_lba = lba;
+
+        uint32_t depth = g_msc_initiator_state.prefetch_adaptive_depth;
         uint32_t max_by_buffer = g_msc_initiator_state.prefetch_bufsize / sectorsize;
         uint32_t max_by_disk = disk_sectorcount - lba;
         if (depth > max_by_buffer) depth = max_by_buffer;
@@ -1662,6 +1921,11 @@ static int32_t append_write_data(uint8_t lun, uint32_t lba, uint32_t offset, con
     // Staging reuses the prefetch buffer, so drop any cached read data.
     g_msc_initiator_state.prefetch_sectorcount = 0;
     g_msc_initiator_state.prefetch_done = false;
+
+    // Reset adaptive prefetch on write start — access pattern changes
+    g_msc_initiator_state.prefetch_adaptive_depth = g_msc_initiator_state.prefetch_depth;
+    g_msc_initiator_state.prefetch_sequential_count = 0;
+    g_msc_initiator_state.prefetch_random_count = 0;
 
     uint32_t stage_capacity = g_msc_initiator_state.prefetch_bufsize;
     uint32_t consumed = 0;

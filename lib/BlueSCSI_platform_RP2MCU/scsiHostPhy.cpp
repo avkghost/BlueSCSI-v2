@@ -51,24 +51,40 @@ void scsiHostPhyRelease();
 #else
 
 // Release bus and pulse RST signal, initialize PHY to host mode.
+// After each RST pulse, verify the bus is free. If not, retry up to 3 times.
 void scsiHostPhyReset(void)
 {
     SCSI_RELEASE_OUTPUTS();
     SCSI_ENABLE_INITIATOR();
 
     scsi_accel_host_init();
+
+    for (int attempt = 0; attempt < 3; attempt++)
+    {
 #if defined(BLUESCSI_ULTRA) || defined(BLUESCSI_ULTRA_WIDE)
-    SCSI_OUT(RST, 0);  // Inverted RST output logic
+        SCSI_OUT(RST, 0);  // Inverted RST output logic
 #else
-    SCSI_OUT(RST, 1);
+        SCSI_OUT(RST, 1);
 #endif
-    platform_delay_ms(2);
+        platform_delay_ms(2);
 #if defined(BLUESCSI_ULTRA) || defined(BLUESCSI_ULTRA_WIDE)
-    SCSI_OUT(RST, 1);  // Inverted RST output logic
+        SCSI_OUT(RST, 1);  // Inverted RST output logic
 #else
-    SCSI_OUT(RST, 0);
+        SCSI_OUT(RST, 0);
 #endif
-    platform_delay_ms(250);
+        platform_delay_ms(250);
+
+        if (!SCSI_IN(BSY) && !SCSI_IN(REQ) && SCSI_IN_DATA() == 0)
+        {
+            break;
+        }
+
+        logmsg("SCSI bus stuck after RST attempt ", attempt + 1,
+               " BSY=", (int)SCSI_IN(BSY),
+               " REQ=", (int)SCSI_IN(REQ),
+               " DATA=0x", SCSI_IN_DATA());
+    }
+
     g_scsiHostPhyReset = false;
 }
 
@@ -89,6 +105,22 @@ bool scsiHostPhySelect(int target_id, uint8_t initiator_id)
         return false;
     }
 #endif
+
+    // Verify bus is free before starting arbitration.
+    SCSI_RELEASE_OUTPUTS();
+    uint32_t bus_wait_start = platform_millis();
+    while (SCSI_IN(BSY) || SCSI_IN(REQ) || SCSI_IN_DATA() != 0)
+    {
+        platform_poll();
+        platform_reset_watchdog();
+
+        if ((uint32_t)(platform_millis() - bus_wait_start) > 500)
+        {
+            logmsg("scsiHostPhySelect: bus stuck before arbitration, forcing reset");
+            scsiHostPhyReset();
+            break;
+        }
+    }
 
     // We can't write individual data bus bits, so use a bit modified
     // arbitration scheme. We always yield to any other initiator on
