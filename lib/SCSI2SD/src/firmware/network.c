@@ -348,8 +348,14 @@ int scsiNetworkCommand()
 				done = 1;
 			}
 
-			// Don't tie up the SCSI bus too long even in multi-packet mode
-			if (!done && total >= (DAYNAPORT_SCSI_PACKET_MAX + 6) * 2)
+			// Don't tie up the SCSI bus too long.  In blind/multi-packet mode
+			// (bit 6 of cdb[5] set, as the Linux scsilink driver sends) the host
+			// asks for a large READ(6) length and expects us to fill the batch,
+			// and there is no VM pager to starve -- so let the host's transfer
+			// size cap (above) govern and pack as many frames as fit.  In classic
+			// polled mode (VM pager present) keep the short-batch guard so a Mac
+			// can grab the SCSI bus between packets.
+			if (!done && !multiPacket && total >= (DAYNAPORT_SCSI_PACKET_MAX + 6) * 2)
 			{
 				done = 1;
 			}
@@ -370,7 +376,10 @@ int scsiNetworkCommand()
 
 			// DaynaPort Mac driver needs a short delay after reading size and flags.
 			// Timing matches real DaynaPORT SCSI/Link-3 behavior observed on a SCSI bus analyzer.
-			sleep_us(75);
+			// The Linux driver in blind/multi-packet mode does not need this delay and
+			// benefits from the host-capable batch before the next READ, so skip it there.
+			if (!multiPacket)
+				sleep_us(75);
 
 			scsiWrite(scsiNetworkInboundQueue.packets[idx], len);
 			while (!scsiIsWriteFinished(NULL))
@@ -383,7 +392,10 @@ int scsiNetworkCommand()
 			{
 				// DaynaPort Mac driver needs a delay between packets.
 				// Timing matches real DaynaPORT SCSI/Link-3 behavior observed on a SCSI bus analyzer.
-				sleep_us(300);
+				// The Linux driver in blind/multi-packet mode streams the batch back to
+				// back to cut per-READ SCSI round trips, so skip the inter-frame delay there.
+				if (!multiPacket)
+					sleep_us(300);
 			}
 		}
 
